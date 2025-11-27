@@ -19,6 +19,9 @@ AUTO_PARAM_TYPE = os.getenv("AUTO_PARAM_TYPE", "mid")
 AUTO_STALE_HOURS = float(os.getenv("AUTO_STALE_HOURS", "6"))
 AUTO_MIN_GM_REWARD = float(os.getenv("AUTO_MIN_GM_REWARD", "0"))
 AUTO_ACTIVITY_FILE = Path(os.getenv("AUTO_ACTIVITY_FILE", "data/market_activity.json"))
+# Scoring weights for candidate ranking
+AUTO_VOL_WEIGHT = float(os.getenv("AUTO_VOL_WEIGHT", "0.5"))  # penalty per unit of volatility_sum
+AUTO_SPREAD_WEIGHT = float(os.getenv("AUTO_SPREAD_WEIGHT", "1.0"))  # penalty per unit of spread
 
 # Initialize global variables
 spreadsheet = get_spreadsheet()
@@ -250,8 +253,15 @@ def auto_manage_selected_markets(new_df, worksheet, client):
         (candidates["best_ask"] > 0)
     ]
 
-    # Highest reward first
-    candidates = candidates.sort_values("gm_reward_per_100", ascending=False)
+    # Score candidates: reward minus penalties for volatility and spread
+    def compute_score(row):
+        reward = float(row.get("gm_reward_per_100", 0) or 0)
+        vol = float(row.get("volatility_sum", 0) or 0)
+        spread = float(row.get("spread", 0) or 0)
+        return reward - AUTO_VOL_WEIGHT * vol - AUTO_SPREAD_WEIGHT * spread
+
+    candidates["score"] = candidates.apply(compute_score, axis=1)
+    candidates = candidates.sort_values("score", ascending=False)
 
     additions = []
     if slots > 0 and len(candidates) > 0:
