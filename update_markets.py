@@ -1,12 +1,24 @@
 import time
 import os
 import argparse
+import json
+from pathlib import Path
 import pandas as pd
 from data_updater.trading_utils import get_clob_client
 from data_updater.google_utils import get_spreadsheet
 from data_updater.find_markets import get_sel_df, get_all_markets, get_all_results, get_markets, add_volatility_to_df
 from gspread_dataframe import set_with_dataframe
 import traceback
+
+# Auto-manage configuration (defaults can be overridden via env)
+AUTO_MANAGE_SELECTED = os.getenv("AUTO_MANAGE_SELECTED", "1") == "1"
+AUTO_MAX_MARKETS = int(os.getenv("AUTO_MAX_MARKETS", "10"))
+AUTO_DEFAULT_TRADE_SIZE = float(os.getenv("AUTO_DEFAULT_TRADE_SIZE", "10"))
+AUTO_DEFAULT_MAX_SIZE = float(os.getenv("AUTO_DEFAULT_MAX_SIZE", "50"))
+AUTO_PARAM_TYPE = os.getenv("AUTO_PARAM_TYPE", "mid")
+AUTO_STALE_HOURS = float(os.getenv("AUTO_STALE_HOURS", "6"))
+AUTO_MIN_GM_REWARD = float(os.getenv("AUTO_MIN_GM_REWARD", "0"))
+AUTO_ACTIVITY_FILE = Path(os.getenv("AUTO_ACTIVITY_FILE", "data/market_activity.json"))
 
 # Initialize global variables
 spreadsheet = get_spreadsheet()
@@ -76,6 +88,193 @@ def sort_df(df):
     
     return sorted_df
 
+
+def _load_activity():
+    try:
+        if AUTO_ACTIVITY_FILE.exists():
+            return json.loads(AUTO_ACTIVITY_FILE.read_text())
+    except Exception:
+        pass
+    return {}
+
+
+def _save_activity(activity):
+    try:
+        AUTO_ACTIVITY_FILE.parent.mkdir(parents=True, exist_ok=True)
+        AUTO_ACTIVITY_FILE.write_text(json.dumps(activity))
+    except Exception as ex:
+        print(f"Warning: could not persist activity file: {ex}")
+
+
+def _update_activity_map(activity_map, df):
+    now = time.time()
+    for _, row in df.iterrows():
+        cid = str(row.get("condition_id", ""))
+        if not cid:
+            continue
+        # Mark activity when there is any bid/ask present
+        try:
+            if float(row.get("best_bid", 0)) > 0 or float(row.get("best_ask", 0)) > 0:
+                activity_map[cid] = now
+        except Exception:
+            pass
+        # Initialize unseen markets to now to give them a grace period
+        activity_map.setdefault(cid, now)
+    return activity_map
+
+
+def _cancel_orders_for_market(client, condition_id):
+    try:
+        client.cancel_market_orders(market=str(condition_id))
+        print(f"Cancelled orders for market {condition_id}")
+    except Exception as ex:
+        print(f"Warning: could not cancel orders for {condition_id}: {ex}")
+
+
+def _build_row_from_candidate(row, columns):
+    # Defaults for custom columns
+    defaults = {
+        "param_type": AUTO_PARAM_TYPE,
+        "trade_size": AUTO_DEFAULT_TRADE_SIZE,
+        "max_size": AUTO_DEFAULT_MAX_SIZE,
+        "min_size": row.get("min_size", AUTO_DEFAULT_TRADE_SIZE),
+        "multiplier": "",
+        "neg_risk": row.get("neg_risk", ""),
+    }
+
+    base = {
+        "question": row.get("question", ""),
+        "answer1": row.get("answer1", ""),
+        "answer2": row.get("answer2", ""),
+        "market_slug": row.get("market_slug", ""),
+        "condition_id": row.get("condition_id", ""),
+        "token1": row.get("token1", ""),
+        "token2": row.get("token2", ""),
+    }
+    base.update(defaults)
+
+    # Fill remaining columns to keep sheet shape intact
+    for col in columns:
+        if col not in base:
+            base[col] = row.get(col, "")
+    return base
+
+
+def auto_manage_selected_markets(new_df, worksheet, client):
+    """
+    Keep Selected Markets capped, add top candidates, remove stale ones (after cancelling orders).
+    """
+    try:
+        current_sel = pd.DataFrame(worksheet.get_all_records())
+    except Exception as ex:
+        print(f"Warning: could not read Selected Markets: {ex}")
+        return
+
+    # Determine columns to preserve
+    sel_columns = list(current_sel.columns) if len(current_sel.columns) > 0 else [
+        "question", "answer1", "answer2", "market_slug", "condition_id",
+        "token1", "token2", "neg_risk", "param_type", "trade_size",
+        "max_size", "min_size", "multiplier"
+    ]
+    if current_sel.empty:
+        current_sel = pd.DataFrame(columns=sel_columns)
+
+    # Update activity map with the latest book data
+    activity_map = _load_activity()
+    activity_map = _update_activity_map(activity_map, new_df)
+    _save_activity(activity_map)
+
+    now = time.time()
+
+    if "condition_id" not in current_sel.columns:
+        print("Selected Markets sheet missing condition_id; skipping auto-manage.")
+        return
+
+    # Merge stats onto selected to evaluate removal
+    stats_cols = ["condition_id", "gm_reward_per_100", "best_bid", "best_ask"]
+    merged = current_sel.merge(new_df[stats_cols], on="condition_id", how="left", suffixes=("", "_stats"))
+
+    stale_ids = []
+    for _, row in merged.iterrows():
+        cid = str(row.get("condition_id", ""))
+        if not cid:
+            continue
+        last_seen = float(activity_map.get(cid, now))
+        time_stale = (now - last_seen) > (AUTO_STALE_HOURS * 3600)
+
+        reward = row.get("gm_reward_per_100", 0)
+        try:
+            reward_val = float(reward) if reward == reward else 0  # handles NaN
+        except Exception:
+            reward_val = 0
+
+        no_liquidity = (float(row.get("best_bid", 0)) == 0) and (float(row.get("best_ask", 0)) == 0)
+        reward_low = reward_val < AUTO_MIN_GM_REWARD
+
+        if time_stale or no_liquidity or reward_low:
+            stale_ids.append(cid)
+
+    if stale_ids:
+        print(f"Auto-manage: marking {len(stale_ids)} market(s) as stale: {stale_ids}")
+        if client is not None:
+            for cid in stale_ids:
+                _cancel_orders_for_market(client, cid)
+        # Remove stale rows
+        current_sel = current_sel[~current_sel["condition_id"].astype(str).isin(stale_ids)]
+
+    # Enforce max markets by trimming lowest reward if still above cap
+    current_sel = current_sel.reset_index(drop=True)
+    if len(current_sel) > AUTO_MAX_MARKETS:
+        trimmed = current_sel.merge(new_df[stats_cols], on="condition_id", how="left")
+        trimmed = trimmed.sort_values("gm_reward_per_100", ascending=False)
+        keep = trimmed.head(AUTO_MAX_MARKETS)["condition_id"].astype(str)
+        drop_ids = set(trimmed["condition_id"].astype(str)) - set(keep)
+        if drop_ids:
+            print(f"Auto-manage: trimming {len(drop_ids)} market(s) to enforce cap: {drop_ids}")
+            if client is not None:
+                for cid in drop_ids:
+                    _cancel_orders_for_market(client, cid)
+            current_sel = current_sel[current_sel["condition_id"].astype(str).isin(keep)]
+
+    # Compute how many slots are open
+    slots = max(0, AUTO_MAX_MARKETS - len(current_sel))
+
+    # Build candidate pool not already selected
+    selected_ids = set(current_sel["condition_id"].astype(str))
+    candidates = new_df[~new_df["condition_id"].astype(str).isin(selected_ids)].copy()
+
+    # Filter candidates by reward/liquidity
+    candidates = candidates[
+        (candidates["gm_reward_per_100"] >= AUTO_MIN_GM_REWARD) &
+        (candidates["best_bid"] > 0) &
+        (candidates["best_ask"] > 0)
+    ]
+
+    # Highest reward first
+    candidates = candidates.sort_values("gm_reward_per_100", ascending=False)
+
+    additions = []
+    if slots > 0 and len(candidates) > 0:
+        for _, row in candidates.head(slots).iterrows():
+            additions.append(_build_row_from_candidate(row, sel_columns))
+
+    if additions:
+        print(f"Auto-manage: adding {len(additions)} market(s) to Selected")
+        additions_df = pd.DataFrame(additions)
+        # Ensure all columns exist
+        for col in sel_columns:
+            if col not in additions_df.columns:
+                additions_df[col] = ""
+        additions_df = additions_df[sel_columns]
+        current_sel = pd.concat([current_sel, additions_df], ignore_index=True)
+
+    # De-dup just in case
+    current_sel = current_sel.drop_duplicates(subset=["condition_id"])
+
+    # Write back
+    update_sheet(current_sel, worksheet)
+    print(f"Auto-manage: Selected Markets now {len(current_sel)} rows (cap {AUTO_MAX_MARKETS})")
+
 def fetch_and_process_data():
     global spreadsheet, client, wk_all, wk_vol, sel_df
     
@@ -84,6 +283,7 @@ def fetch_and_process_data():
 
     wk_all = spreadsheet.worksheet("All Markets")
     wk_vol = spreadsheet.worksheet("Volatility Markets")
+    wk_selected = spreadsheet.worksheet("Selected Markets")
     wk_full = spreadsheet.worksheet("Full Markets")
 
     sel_df = get_sel_df(spreadsheet, "Selected Markets")
@@ -122,6 +322,8 @@ def fetch_and_process_data():
         update_sheet(new_df, wk_all)
         update_sheet(volatility_df, wk_vol)
         update_sheet(m_data, wk_full)
+        if AUTO_MANAGE_SELECTED:
+            auto_manage_selected_markets(new_df, wk_selected, client)
     else:
         print(f'{pd.to_datetime("now")}: Not updating sheet because of length {len(new_df)}.')
 
