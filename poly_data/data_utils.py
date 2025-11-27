@@ -150,6 +150,15 @@ def update_markets():
 
     if len(received_df) > 0:
         global_state.df, global_state.params = received_df.copy(), received_params
+    else:
+        print("Warning: Received empty Selected/All Markets merge; skipping update_markets")
+        return
+
+    required_cols = {'token1', 'token2', 'question'}
+    missing = required_cols - set(global_state.df.columns)
+    if missing:
+        print(f"Warning: update_markets missing required columns {missing}; skipping update.")
+        return
     
     new_tokens_added = False
 

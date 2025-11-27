@@ -117,6 +117,11 @@ async def main():
     # Main loop - maintain websocket connections
     while True:
         try:
+            if not global_state.all_tokens:
+                print("No markets to subscribe to yet; waiting for update_markets to populate tokens.")
+                await asyncio.sleep(5)
+                continue
+
             # Connect to market and user websockets simultaneously
             await asyncio.gather(
                 connect_market_websocket(global_state.all_tokens, global_state.market_tokens_version), 

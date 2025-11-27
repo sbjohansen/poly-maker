@@ -281,6 +281,12 @@ def auto_manage_selected_markets(new_df, worksheet, client):
     # De-dup just in case
     current_sel = current_sel.drop_duplicates(subset=["condition_id"])
 
+    # Keep ID columns as strings to avoid scientific notation
+    id_cols = ['condition_id', 'token1', 'token2']
+    for col in id_cols:
+        if col in current_sel.columns:
+            current_sel[col] = current_sel[col].astype(str)
+
     # Write back
     update_sheet(current_sel, worksheet)
     print(f"Auto-manage: Selected Markets now {len(current_sel)} rows (cap {AUTO_MAX_MARKETS})")
@@ -327,6 +333,14 @@ def fetch_and_process_data():
     
 
     print(f'{pd.to_datetime("now")}: Fetched select market of length {len(new_df)}.')
+
+    # Ensure ID columns remain strings (avoid scientific notation in Sheets)
+    id_cols = ['token1', 'token2', 'condition_id']
+    for col in id_cols:
+        if col in new_df.columns:
+            new_df[col] = new_df[col].astype(str)
+        if col in m_data.columns:
+            m_data[col] = m_data[col].astype(str)
 
     if len(new_df) > 50:
         update_sheet(new_df, wk_all)
