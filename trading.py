@@ -159,7 +159,11 @@ async def perform_trade(market):
         try:
             client = global_state.client
             # Get market details from the configuration
-            row = global_state.df[global_state.df['condition_id'] == market].iloc[0]      
+            rows = global_state.df[global_state.df['condition_id'] == market]
+            if rows.empty:
+                print(f"Perform_trade: no config row found for market {market}, skipping.")
+                return
+            row = rows.iloc[0]
             # Determine decimal precision from tick size
             round_length = len(str(row['tick_size']).split(".")[1])
 
