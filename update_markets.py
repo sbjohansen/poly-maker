@@ -22,6 +22,8 @@ AUTO_ACTIVITY_FILE = Path(os.getenv("AUTO_ACTIVITY_FILE", "data/market_activity.
 # Scoring weights for candidate ranking
 AUTO_VOL_WEIGHT = float(os.getenv("AUTO_VOL_WEIGHT", "0.5"))  # penalty per unit of volatility_sum
 AUTO_SPREAD_WEIGHT = float(os.getenv("AUTO_SPREAD_WEIGHT", "1.0"))  # penalty per unit of spread
+# Allow min_size up to this multiple of trade_size when auto-selecting
+AUTO_MIN_SIZE_MULT = float(os.getenv("AUTO_MIN_SIZE_MULT", "2.0"))
 
 # Initialize global variables
 spreadsheet = get_spreadsheet()
@@ -252,9 +254,10 @@ def auto_manage_selected_markets(new_df, worksheet, client):
         (candidates["best_bid"] > 0) &
         (candidates["best_ask"] > 0)
     ]
-    # Skip markets where the minimum size exceeds our default trade size
+    # Skip markets where the minimum size is far above our trade size (configurable multiple)
     if "min_size" in candidates.columns:
-        candidates = candidates[pd.to_numeric(candidates["min_size"], errors="coerce") <= AUTO_DEFAULT_TRADE_SIZE]
+        min_size_numeric = pd.to_numeric(candidates["min_size"], errors="coerce")
+        candidates = candidates[min_size_numeric <= AUTO_DEFAULT_TRADE_SIZE * AUTO_MIN_SIZE_MULT]
 
     # Score candidates: reward minus penalties for volatility and spread
     def compute_score(row):
