@@ -151,6 +151,7 @@ def update_markets():
     if len(received_df) > 0:
         global_state.df, global_state.params = received_df.copy(), received_params
     
+    new_tokens_added = False
 
     for _, row in global_state.df.iterrows():
         for col in ['token1', 'token2']:
@@ -158,6 +159,7 @@ def update_markets():
 
         if row['token1'] not in global_state.all_tokens:
             global_state.all_tokens.append(row['token1'])
+            new_tokens_added = True
 
         if row['token1'] not in global_state.REVERSE_TOKENS:
             global_state.REVERSE_TOKENS[row['token1']] = row['token2']
@@ -168,3 +170,7 @@ def update_markets():
         for col2 in [f"{row['token1']}_buy", f"{row['token1']}_sell", f"{row['token2']}_buy", f"{row['token2']}_sell"]:
             if col2 not in global_state.performing:
                 global_state.performing[col2] = set()
+
+    if new_tokens_added:
+        global_state.market_tokens_version += 1
+        print(f"New markets detected. Subscription version is now {global_state.market_tokens_version}. Total tokens: {len(global_state.all_tokens)}")

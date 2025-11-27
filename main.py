@@ -3,6 +3,7 @@ import time                    # Time functions
 import asyncio                 # Asynchronous I/O
 import traceback               # Exception handling
 import threading               # Thread management
+import os                      # Environment variables for debug flags
 
 from poly_data.polymarket_client import PolymarketClient
 from poly_data.data_utils import update_markets, update_positions, update_orders
@@ -53,6 +54,9 @@ def update_periodically():
     - Market data is updated every 30 seconds (every 6 cycles)
     - Stale pending trades are removed each cycle
     """
+    debug_orders = os.getenv("DEBUG_OPEN_ORDERS") == "1"
+    last_orders_log = 0
+
     i = 1
     while True:
         time.sleep(5)  # Update every 5 seconds
@@ -69,6 +73,21 @@ def update_periodically():
             if i % 6 == 0:
                 update_markets()
                 i = 1
+
+            if debug_orders:
+                now = time.time()
+                if now - last_orders_log >= 60:
+                    try:
+                        orders_snapshot = global_state.client.get_all_orders()
+                        print(f"[DEBUG] Open orders ({len(orders_snapshot)}):")
+                        cols = ['asset_id', 'market', 'side', 'price', 'original_size', 'size_matched']
+                        try:
+                            print(orders_snapshot[orders_snapshot.columns.intersection(cols)])
+                        except Exception:
+                            print(orders_snapshot)
+                    except Exception as e:
+                        print(f"[DEBUG] Failed to fetch open orders: {e}")
+                    last_orders_log = now
                     
             gc.collect()  # Force garbage collection to free memory
             i += 1
@@ -100,7 +119,7 @@ async def main():
         try:
             # Connect to market and user websockets simultaneously
             await asyncio.gather(
-                connect_market_websocket(global_state.all_tokens), 
+                connect_market_websocket(global_state.all_tokens, global_state.market_tokens_version), 
                 connect_user_websocket()
             )
             print("Reconnecting to the websocket")

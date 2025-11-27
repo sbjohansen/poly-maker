@@ -6,6 +6,9 @@ import pandas as pd
 # List of all tokens being tracked
 all_tokens = []
 
+# Version counter for market token subscriptions. Increment when all_tokens grows.
+market_tokens_version = 0
+
 # Mapping between tokens in the same market (YES->NO, NO->YES)
 REVERSE_TOKENS = {}  
 
@@ -46,4 +49,3 @@ orders = {}
 # Current positions for each token
 # Format: {token_id: {'size': float, 'avgPrice': float}}
 positions = {}
-

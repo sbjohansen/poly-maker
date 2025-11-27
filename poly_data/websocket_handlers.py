@@ -6,7 +6,7 @@ import traceback                   # Exception handling
 from poly_data.data_processing import process_data, process_user_data
 import poly_data.global_state as global_state
 
-async def connect_market_websocket(chunk):
+async def connect_market_websocket(chunk, version=None):
     """
     Connect to Polymarket's market WebSocket API and process market updates.
     
@@ -17,12 +17,14 @@ async def connect_market_websocket(chunk):
     
     Args:
         chunk (list): List of token IDs to subscribe to
+        version (int): Subscription version to track live updates
         
     Notes:
         If the connection is lost, the function will exit and the main loop will
         attempt to reconnect after a short delay.
     """
     uri = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+    expected_version = version if version is not None else global_state.market_tokens_version
     async with websockets.connect(uri, ping_interval=5, ping_timeout=None) as websocket:
         # Prepare and send subscription message
         message = {"assets_ids": chunk}
@@ -38,6 +40,11 @@ async def connect_market_websocket(chunk):
                 json_data = json.loads(message)
                 # Process order book updates and trigger trading as needed
                 process_data(json_data)
+
+                # If subscription version changed (new markets added), drop connection to resubscribe
+                if global_state.market_tokens_version != expected_version:
+                    print(f"Market subscription version changed ({expected_version} -> {global_state.market_tokens_version}); reconnecting to include new markets.")
+                    break
         except websockets.ConnectionClosed:
             print("Connection closed in market websocket")
             print(traceback.format_exc())

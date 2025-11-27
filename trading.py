@@ -66,13 +66,17 @@ def send_buy_order(order):
         if order['price'] >= 0.1 and order['price'] < 0.9:
             print(f'Creating new order for {order["size"]} at {order["price"]}')
             print(order['token'], 'BUY', order['price'], order['size'])
-            client.create_order(
-                order['token'], 
-                'BUY', 
-                order['price'], 
-                order['size'], 
-                True if order['neg_risk'] == 'TRUE' else False
-            )
+            try:
+                resp = client.create_order(
+                    order['token'], 
+                    'BUY', 
+                    order['price'], 
+                    order['size'], 
+                    True if order['neg_risk'] == 'TRUE' else False
+                )
+                print(f"create_order BUY response: {resp}")
+            except Exception as ex:
+                print(f"create_order BUY failed: {ex}")
         else:
             print("Not creating buy order because its outside acceptable price range (0.1-0.9)")
     else:
@@ -110,17 +114,25 @@ def send_sell_order(order):
         print(f"Cancelling sell orders - price diff: {price_diff:.4f}, size diff: {size_diff:.1f}")
         client.cancel_all_asset(order['token'])
     elif not should_cancel:
-        print(f"Keeping existing sell orders - minor changes: price diff: {price_diff:.4f}, size diff: {size_diff:.1f}")
+        print(
+            f"Keeping existing sell orders - minor changes: price diff: {price_diff:.4f}, "
+            f"size diff: {size_diff:.1f}, existing_sell_price: {existing_sell_price}, "
+            f"target_price: {order['price']}, existing_sell_size: {existing_sell_size}"
+        )
         return  # Don't place new order if existing one is fine
 
     print(f'Creating new order for {order["size"]} at {order["price"]}')
-    client.create_order(
-        order['token'], 
-        'SELL', 
-        order['price'], 
-        order['size'], 
-        True if order['neg_risk'] == 'TRUE' else False
-    )
+    try:
+        resp = client.create_order(
+            order['token'], 
+            'SELL', 
+            order['price'], 
+            order['size'], 
+            True if order['neg_risk'] == 'TRUE' else False
+        )
+        print(f"create_order SELL response: {resp}")
+    except Exception as ex:
+        print(f"create_order SELL failed: {ex}")
 
 # Dictionary to store locks for each market to prevent concurrent trading on the same market
 market_locks = {}

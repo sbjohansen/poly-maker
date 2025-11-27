@@ -1,4 +1,6 @@
 import time
+import os
+import argparse
 import pandas as pd
 from data_updater.trading_utils import get_clob_client
 from data_updater.google_utils import get_spreadsheet
@@ -123,11 +125,31 @@ def fetch_and_process_data():
     else:
         print(f'{pd.to_datetime("now")}: Not updating sheet because of length {len(new_df)}.')
 
-if __name__ == "__main__":
+def main():
+    parser = argparse.ArgumentParser(description="Fetch and update market data in a loop")
+    parser.add_argument(
+        "--interval-minutes",
+        type=int,
+        default=int(os.getenv("UPDATE_INTERVAL_MINUTES", "60")),
+        help="Minutes to wait between runs (default: 60 or UPDATE_INTERVAL_MINUTES env var)",
+    )
+    args = parser.parse_args()
+
+    interval_minutes = max(1, args.interval_minutes)
+    print(f"Running update loop every {interval_minutes} minute(s)")
+
     while True:
         try:
             fetch_and_process_data()
-            time.sleep(60 * 60)  # Sleep for an hour
         except Exception as e:
             traceback.print_exc()
             print(str(e))
+        try:
+            time.sleep(interval_minutes * 60)
+        except KeyboardInterrupt:
+            print("Received KeyboardInterrupt, exiting loop")
+            break
+
+
+if __name__ == "__main__":
+    main()
