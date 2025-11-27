@@ -14,6 +14,10 @@ def get_sel_df(spreadsheet, sheet_name='Selected Markets'):
     try:
         wk2 = spreadsheet.worksheet(sheet_name)
         sel_df = pd.DataFrame(wk2.get_all_records())
+        # Gracefully handle sheets missing expected columns
+        if 'question' not in sel_df.columns:
+            print(f"Warning: '{sheet_name}' is missing 'question' column; treating as empty.")
+            return pd.DataFrame()
         sel_df = sel_df[sel_df['question'] != ""].reset_index(drop=True)
         return sel_df
     except:
@@ -319,6 +323,10 @@ def add_volatility_to_df(df, max_workers=2):
 
     
 def get_markets(all_results, sel_df, maker_reward=1):
+    # If Selected Markets sheet lacks expected columns, treat as empty selection
+    if 'question' not in sel_df.columns:
+        sel_df = pd.DataFrame(columns=['question'])
+
     new_df = pd.DataFrame(all_results)
     new_df['spread'] = abs(new_df['best_ask'] - new_df['best_bid'])
     new_df = new_df.sort_values('rewards_daily_rate', ascending=False)

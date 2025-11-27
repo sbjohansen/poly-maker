@@ -39,6 +39,23 @@ def get_sheet_df(read_only=None):
 
     result = df.merge(df2, on='question', how='inner')
 
+    # Handle duplicate columns from merge (e.g., token1_x / token1_y)
+    suffixes = ['_x', '_y']
+    dup_bases = set()
+    for col in result.columns:
+        for suf in suffixes:
+            if col.endswith(suf):
+                dup_bases.add(col[: -len(suf)])
+
+    for base in dup_bases:
+        left = base + '_x'
+        right = base + '_y'
+        if left in result.columns or right in result.columns:
+            result[base] = result[left] if left in result.columns else result[right]
+            if left in result.columns and right in result.columns:
+                result[base] = result[left].where(result[left].notna() & (result[left] != ""), result[right])
+            result.drop(columns=[c for c in [left, right] if c in result.columns], inplace=True, errors='ignore')
+
     wk_p = spreadsheet.worksheet('Hyperparameters')
     records = wk_p.get_all_records()
     hyperparams, current_type = {}, None
