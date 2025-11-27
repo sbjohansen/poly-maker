@@ -2,9 +2,25 @@ import json
 from poly_utils.google_utils import get_spreadsheet
 import pandas as pd 
 import os
+from decimal import Decimal
 
 def pretty_print(txt, dic):
     print("\n", txt, json.dumps(dic, indent=4))
+
+
+def _normalize_token_id(val):
+    """
+    Ensure token/condition ids are stringified without scientific notation.
+    """
+    if pd.isna(val):
+        return ""
+    if isinstance(val, str):
+        return val.strip()
+    try:
+        # Use Decimal to avoid float scientific notation
+        return format(Decimal(str(val)), 'f').split('.')[0]
+    except Exception:
+        return str(val)
 
 def get_sheet_df(read_only=None):
     """
@@ -55,6 +71,11 @@ def get_sheet_df(read_only=None):
             if left in result.columns and right in result.columns:
                 result[base] = result[left].where(result[left].notna() & (result[left] != ""), result[right])
             result.drop(columns=[c for c in [left, right] if c in result.columns], inplace=True, errors='ignore')
+
+    # Normalize IDs to plain strings (avoid scientific notation from Sheets)
+    for col in ["token1", "token2", "condition_id"]:
+        if col in result.columns:
+            result[col] = result[col].apply(_normalize_token_id)
 
     wk_p = spreadsheet.worksheet('Hyperparameters')
     records = wk_p.get_all_records()
