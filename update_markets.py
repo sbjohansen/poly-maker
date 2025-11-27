@@ -252,6 +252,9 @@ def auto_manage_selected_markets(new_df, worksheet, client):
         (candidates["best_bid"] > 0) &
         (candidates["best_ask"] > 0)
     ]
+    # Skip markets where the minimum size exceeds our default trade size
+    if "min_size" in candidates.columns:
+        candidates = candidates[pd.to_numeric(candidates["min_size"], errors="coerce") <= AUTO_DEFAULT_TRADE_SIZE]
 
     # Score candidates: reward minus penalties for volatility and spread
     def compute_score(row):
