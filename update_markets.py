@@ -24,6 +24,8 @@ AUTO_VOL_WEIGHT = float(os.getenv("AUTO_VOL_WEIGHT", "0.5"))  # penalty per unit
 AUTO_SPREAD_WEIGHT = float(os.getenv("AUTO_SPREAD_WEIGHT", "1.0"))  # penalty per unit of spread
 # Allow min_size up to this multiple of trade_size when auto-selecting
 AUTO_MIN_SIZE_MULT = float(os.getenv("AUTO_MIN_SIZE_MULT", "2.0"))
+# Always rebuild Selected Markets instead of preserving existing rows
+AUTO_RESET_SELECTED = os.getenv("AUTO_RESET_SELECTED", "0") == "1"
 
 # Initialize global variables
 spreadsheet = get_spreadsheet()
@@ -184,6 +186,13 @@ def auto_manage_selected_markets(new_df, worksheet, client):
     if current_sel.empty:
         current_sel = pd.DataFrame(columns=sel_columns)
 
+    if AUTO_RESET_SELECTED:
+        print("AUTO_RESET_SELECTED enabled; clearing Selected Markets and rebuilding.")
+        if client is not None and "condition_id" in current_sel.columns:
+            for cid in current_sel["condition_id"].astype(str):
+                _cancel_orders_for_market(client, cid)
+        current_sel = pd.DataFrame(columns=sel_columns)
+
     # Update activity map with the latest book data
     activity_map = _load_activity()
     activity_map = _update_activity_map(activity_map, new_df)
@@ -292,6 +301,22 @@ def auto_manage_selected_markets(new_df, worksheet, client):
     for col in id_cols:
         if col in current_sel.columns:
             current_sel[col] = current_sel[col].astype(str)
+
+    # Normalize sizing columns using defaults
+    if "trade_size" in current_sel.columns:
+        current_sel["trade_size"] = AUTO_DEFAULT_TRADE_SIZE
+    else:
+        current_sel["trade_size"] = AUTO_DEFAULT_TRADE_SIZE
+    if "max_size" in current_sel.columns:
+        current_sel["max_size"] = AUTO_DEFAULT_MAX_SIZE
+    else:
+        current_sel["max_size"] = AUTO_DEFAULT_MAX_SIZE
+    if "min_size" in current_sel.columns and "condition_id" in current_sel.columns:
+        min_map = pd.to_numeric(new_df.set_index("condition_id")["min_size"], errors="coerce")
+        current_sel["min_size"] = current_sel["condition_id"].map(min_map).fillna(AUTO_DEFAULT_TRADE_SIZE)
+    elif "condition_id" in current_sel.columns:
+        min_map = pd.to_numeric(new_df.set_index("condition_id")["min_size"], errors="coerce")
+        current_sel["min_size"] = current_sel["condition_id"].map(min_map).fillna(AUTO_DEFAULT_TRADE_SIZE)
 
     # Write back
     update_sheet(current_sel, worksheet)
