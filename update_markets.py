@@ -369,21 +369,19 @@ def auto_manage_selected_markets(new_df, worksheet, client, hyperparams=None):
         if col in current_sel.columns:
             current_sel[col] = current_sel[col].astype(str)
 
-    # Normalize sizing columns using defaults
-    if "trade_size" in current_sel.columns:
-        current_sel["trade_size"] = AUTO_DEFAULT_TRADE_SIZE
-    else:
-        current_sel["trade_size"] = AUTO_DEFAULT_TRADE_SIZE
-    if "max_size" in current_sel.columns:
-        current_sel["max_size"] = AUTO_DEFAULT_MAX_SIZE
-    else:
-        current_sel["max_size"] = AUTO_DEFAULT_MAX_SIZE
-    if "min_size" in current_sel.columns and "condition_id" in current_sel.columns:
-        min_map = pd.to_numeric(new_df.set_index("condition_id")["min_size"], errors="coerce")
-        current_sel["min_size"] = current_sel["condition_id"].map(min_map).fillna(AUTO_DEFAULT_TRADE_SIZE)
-    elif "condition_id" in current_sel.columns:
-        min_map = pd.to_numeric(new_df.set_index("condition_id")["min_size"], errors="coerce")
-        current_sel["min_size"] = current_sel["condition_id"].map(min_map).fillna(AUTO_DEFAULT_TRADE_SIZE)
+    # Normalize sizing columns using defaults and ensure we can place orders
+    min_map = pd.to_numeric(new_df.set_index("condition_id")["min_size"], errors="coerce") if "condition_id" in new_df.columns else {}
+    min_series = current_sel["condition_id"].map(min_map) if "condition_id" in current_sel.columns else None
+    if min_series is None:
+        min_series = pd.Series(AUTO_DEFAULT_TRADE_SIZE, index=current_sel.index)
+    min_series = min_series.fillna(AUTO_DEFAULT_TRADE_SIZE)
+    current_sel["min_size"] = min_series
+
+    trade_series = min_series.where(min_series > AUTO_DEFAULT_TRADE_SIZE, AUTO_DEFAULT_TRADE_SIZE)
+    current_sel["trade_size"] = trade_series
+
+    max_series = trade_series.where(trade_series > AUTO_DEFAULT_MAX_SIZE, AUTO_DEFAULT_MAX_SIZE)
+    current_sel["max_size"] = max_series
 
     # Write back
     update_sheet(current_sel, worksheet)
