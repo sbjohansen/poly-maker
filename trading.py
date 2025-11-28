@@ -147,6 +147,8 @@ def send_buy_order(order):
         order (dict): Order details including token, price, size, and market parameters
     """
     client = global_state.client
+    token = order["token"]
+    update_reason = order.get("update_reason", "")
 
     # Only cancel existing orders if we need to make significant changes
     existing_buy_size = order["orders"]["buy"]["size"]
@@ -169,11 +171,13 @@ def send_buy_order(order):
     )
 
     if should_cancel and (existing_buy_size > 0 or order["orders"]["sell"]["size"] > 0):
-        print(f"Cancelling buy orders - price diff: {price_diff:.4f}, size diff: {size_diff:.1f} ({size_pct_diff*100:.0f}%)")
+        print(f"Updating buy order for {token}: {update_reason}")
+        print(f"  Cancelling old order - price diff: {price_diff:.4f}, size diff: {size_diff:.1f} ({size_pct_diff*100:.0f}%)")
         client.cancel_all_asset(order["token"])
     elif not should_cancel:
         print(
-            f"Keeping existing buy orders - minor changes: price diff: {price_diff:.4f}, size diff: {size_diff:.1f}"
+            f"Keeping buy order for {token}: price={existing_buy_price:.2f}, size={existing_buy_size:.0f} "
+            f"(minor changes: price diff={price_diff:.4f}, size diff={size_diff:.1f})"
         )
         return  # Don't place new order if existing one is fine
 
@@ -479,13 +483,9 @@ async def perform_trade(market):
                 # File to store risk management information for this market
                 fname = "positions/" + str(market) + ".json"
 
-                # ------- SELL ORDER LOGIC -------
-                if sell_amount > 0:
-                    # Skip if we have no average price (no real position)
-                    if avgPrice == 0:
-                        print("Avg Price is 0. Skipping")
-                        continue
-
+                # ------- SELL ORDER LOGIC (STOP-LOSS) -------
+                # SAFETY CHECK: Only proceed with sell logic if we actually have a position
+                if sell_amount > 0 and position > 0 and avgPrice > 0:
                     order["size"] = sell_amount
                     order["price"] = ask_price
 
@@ -614,95 +614,130 @@ async def perform_trade(market):
                             )
                             # Don't cancel - the order book data might be stale
                         else:
+                            # MARKET MAKING STRATEGY: Allow positions on BOTH sides
+                            # Polymarket rewards are maximized by providing liquidity on both bid AND ask
+                            # Auto-merge will recover capital if both sides fill
+                            
                             # Check for reverse position (holding opposite outcome)
                             rev_token = global_state.REVERSE_TOKENS[str(token)]
                             rev_pos = get_position(rev_token)
+                            current_pos = get_position(str(token))
 
-                            # If we have significant opposing position, don't buy more
-                            if rev_pos["size"] > row["min_size"]:
+                            # Calculate total exposure across both sides
+                            total_exposure = current_pos["size"] + rev_pos["size"]
+                            
+                            # Allow buying if:
+                            # 1. Current token position is below max_size, AND
+                            # 2. Total exposure (both sides) is below 2x max_size (safety cap)
+                            max_total_exposure = max_size * 2  # Can hold max_size on each side
+                            
+                            skip_buy = False  # Flag to skip buy but still process sell
+                            
+                            if position >= max_size:
                                 print(
-                                    "Bypassing creation of new buy order because there is a reverse position"
+                                    f"Skipping buy order - already at max position ({position:.0f}/{max_size:.0f})"
                                 )
-                                if orders["buy"]["size"] > CONSTANTS.MIN_MERGE_SIZE:
-                                    print(
-                                        "Cancelling buy orders because there is a reverse position"
-                                    )
-                                    client.cancel_all_asset(order["token"])
-
-                                continue
+                                skip_buy = True
+                            
+                            if total_exposure >= max_total_exposure:
+                                print(
+                                    f"Skipping buy order - total exposure at cap ({total_exposure:.0f}/{max_total_exposure:.0f}). "
+                                    f"Waiting for merge or sells to free capital."
+                                )
+                                skip_buy = True
 
                             # Check market buy/sell volume ratio
-                            if overall_ratio < 0:
+                            if not skip_buy and overall_ratio < 0:
                                 send_buy = False
                                 print(
                                     f"Not sending a buy order because overall ratio is {overall_ratio}"
                                 )
                                 client.cancel_all_asset(order["token"])
-                            else:
+                            elif not skip_buy:
                                 # Place new buy order if any of these conditions are met:
                                 # 1. We can get a better price than current order
                                 if best_bid > orders["buy"]["price"]:
-                                    print(
-                                        f"Sending Buy Order for {token} because better price. "
-                                        f"Orders look like this: {orders['buy']}. Best Bid: {best_bid}"
-                                    )
+                                    order["update_reason"] = f"better price available (bid {best_bid:.2f} > order {orders['buy']['price']:.2f})"
                                     send_buy_order(order)
                                 # 2. Current position + orders is not enough to reach max_size
                                 elif position + orders["buy"]["size"] < 0.95 * max_size:
-                                    print(
-                                        f"Sending Buy Order for {token} because not enough position + size"
-                                    )
+                                    order["update_reason"] = f"need more size (pos {position:.0f} + orders {orders['buy']['size']:.0f} < {0.95*max_size:.0f})"
                                     send_buy_order(order)
                                 # 3. Our current order is too large and needs to be resized
                                 elif orders["buy"]["size"] > order["size"] * 1.01:
-                                    print(f"Resending buy orders because open orders are too large")
+                                    order["update_reason"] = f"order too large ({orders['buy']['size']:.0f} > target {order['size']:.0f})"
                                     send_buy_order(order)
+                                else:
+                                    # No changes needed
+                                    print(
+                                        f"Keeping buy order for {token}: price={orders['buy']['price']:.2f}, "
+                                        f"size={orders['buy']['size']:.0f}/{max_size:.0f}"
+                                    )
                                 # Commented out logic for cancelling orders when market conditions change
                                 # elif best_bid_size < orders['buy']['size'] * 0.98 and abs(best_bid - second_best_bid) > 0.03:
                                 #     print(f"Cancelling buy orders because best size is less than 90% of open orders and spread is too large")
                                 #     global_state.client.cancel_all_asset(order['token'])
 
                 # ------- TAKE PROFIT / SELL ORDER MANAGEMENT -------
-                elif sell_amount > 0:
+                # NOTE: Changed from 'elif' to 'if' to enable TWO-SIDED QUOTING
+                # Polymarket rewards require BOTH bid AND ask orders: Qmin = min(Qbid, Qask)
+                # With 'elif', we could only have one side, missing rewards entirely
+                # SAFETY CHECK: Only place sell orders if we have a position AND avgPrice
+                if sell_amount > 0 and position > 0 and avgPrice > 0:
                     order["size"] = sell_amount
 
                     # Calculate take-profit price based on average cost
+                    # This is the MINIMUM price we want to sell at
                     tp_price = round_up(
                         avgPrice + (avgPrice * params["take_profit_threshold"] / 100), round_length
                     )
-                    order["price"] = round_up(
-                        tp_price if ask_price < tp_price else ask_price, round_length
+                    
+                    # For sell orders, we want the HIGHER of:
+                    # 1. Our take-profit price (minimum acceptable)
+                    # 2. Current ask price (market rate)
+                    # This ensures we don't sell below our profit target
+                    target_sell_price = round_up(
+                        max(tp_price, ask_price), round_length
                     )
+                    order["price"] = target_sell_price
 
-                    tp_price = float(tp_price)
-                    order_price = float(orders["sell"]["price"])
+                    existing_sell_price = float(orders["sell"]["price"])
+                    existing_sell_size = float(orders["sell"]["size"])
 
-                    # Calculate % difference between current order and ideal price
-                    diff = abs(order_price - tp_price) / tp_price * 100
-
-                    # Update sell order if:
-                    # 1. Current order price is significantly different from target
-                    if diff > 2:
+                    # Calculate if we need to update the sell order
+                    # Only update if:
+                    # 1. No existing sell order, OR
+                    # 2. Price changed significantly (> 2 cents), OR
+                    # 3. Existing size is significantly different from target size (not position!)
+                    
+                    needs_update = False
+                    update_reason = ""
+                    
+                    target_size = sell_amount  # This is what we want to place
+                    
+                    if existing_sell_size == 0:
+                        needs_update = True
+                        update_reason = "no existing sell order"
+                    elif abs(existing_sell_price - target_sell_price) > 0.02:
+                        needs_update = True
+                        update_reason = f"price changed: {existing_sell_price:.2f} -> {target_sell_price:.2f}"
+                    elif abs(existing_sell_size - target_size) > target_size * 0.1:
+                        # Only update if existing size differs from TARGET size by >10%
+                        needs_update = True
+                        update_reason = f"size mismatch: {existing_sell_size:.0f} vs target {target_size:.0f}"
+                    
+                    if needs_update:
                         print(
-                            f"Sending Sell Order for {token} because better current order price of "
-                            f"{order_price} is deviant from the tp_price of {tp_price} and diff is {diff}"
+                            f"Sending Sell Order for {token}: {update_reason}. "
+                            f"Target: {target_sell_price:.2f}, TP: {tp_price:.2f}, Ask: {ask_price:.2f}"
                         )
                         send_sell_order(order)
-                    # 2. Current order size is too small for our position
-                    elif orders["sell"]["size"] < position * 0.97:
+                    else:
+                        pnl_pct = (existing_sell_price - avgPrice) / avgPrice * 100 if avgPrice > 0 else 0
                         print(
-                            f"Sending Sell Order for {token} because not enough sell size. "
-                            f"Position: {position}, Sell Size: {orders['sell']['size']}"
+                            f"Keeping sell order for {token}: price={existing_sell_price:.2f}, "
+                            f"size={existing_sell_size:.0f}/{position:.0f}, PnL={pnl_pct:.1f}%"
                         )
-                        send_sell_order(order)
-
-                    # Commented out additional conditions for updating sell orders
-                    # elif orders['sell']['price'] < ask_price:
-                    #     print(f"Updating Sell Order for {token} because its not at the right price")
-                    #     send_sell_order(order)
-                    # elif best_ask_size < orders['sell']['size'] * 0.98 and abs(best_ask - second_best_ask) > 0.03...:
-                    #     print(f"Cancelling sell orders because best size is less than 90% of open orders...")
-                    #     send_sell_order(order)
 
         except Exception as ex:
             print(f"Error performing trade for {market}: {ex}")

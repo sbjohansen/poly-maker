@@ -220,15 +220,24 @@ def process_single_row(row, client):
     return ret
 
 
-def get_all_results(all_df, client, max_workers=5):
+def get_all_results(all_df, client, max_workers=20):
+    """Fetch order book data for all markets using parallel threads.
+    
+    Args:
+        all_df: DataFrame of all markets
+        client: ClobClient instance
+        max_workers: Number of parallel threads (default 20 for faster processing)
+    """
     all_results = []
+    total = len(all_df)
+    processed = 0
 
     def process_with_progress(args):
         idx, row = args
         try:
             return process_single_row(row, client)
-        except:
-            print("error fetching market")
+        except Exception as e:
+            # Silent fail for individual markets
             return None
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -236,11 +245,13 @@ def get_all_results(all_df, client, max_workers=5):
         
         for future in concurrent.futures.as_completed(futures):
             result = future.result()
+            processed += 1
             if result is not None:
                 all_results.append(result)
 
-            if len(all_results) % (max_workers * 2) == 0:
-                print(f'{len(all_results)} of {len(all_df)}')
+            # Less frequent progress updates to reduce console spam
+            if processed % 50 == 0 or processed == total:
+                print(f'Order books: {processed}/{total} ({len(all_results)} valid)')
 
     return all_results
 
@@ -294,10 +305,17 @@ def add_volatility(row):
     new_dict = {**row_dict, **stats}
     return new_dict
 
-def add_volatility_to_df(df, max_workers=2):
+def add_volatility_to_df(df, max_workers=15):
+    """Add volatility data to markets using parallel threads.
     
+    Args:
+        df: DataFrame of markets
+        max_workers: Number of parallel threads (default 15 for faster processing)
+    """
     results = []
     df = df.reset_index(drop=True)
+    total = len(df)
+    processed = 0
 
     def process_volatility_with_progress(args):
         idx, row = args
@@ -305,19 +323,27 @@ def add_volatility_to_df(df, max_workers=2):
             ret = add_volatility(row.to_dict())
             return ret
         except:
-            print("Error fetching volatility")
-            return None
+            # Return row without volatility data rather than failing
+            row_dict = row.to_dict()
+            row_dict.update({
+                '1_hour': 0, '3_hour': 0, '6_hour': 0, '12_hour': 0,
+                '24_hour': 0, '7_day': 0, '14_day': 0, '30_day': 0,
+                'volatility_price': 0
+            })
+            return row_dict
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = [executor.submit(process_volatility_with_progress, (idx, row)) for idx, row in df.iterrows()]
         
         for future in concurrent.futures.as_completed(futures):
             result = future.result()
+            processed += 1
             if result is not None:
                 results.append(result)
                 
-            if len(results) % (max_workers * 2) == 0:
-                print(f'{len(results)} of {len(df)}')
+            # Less frequent progress updates
+            if processed % 50 == 0 or processed == total:
+                print(f'Volatility: {processed}/{total}')
             
     return pd.DataFrame(results)
 

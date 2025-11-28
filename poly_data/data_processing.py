@@ -39,14 +39,28 @@ def process_price_change(asset, side, price_level, new_size, asset_id=None):
         book[price_level] = new_size
 
 def process_data(json_datas, trade=True):
+    """
+    Process market websocket events (order book updates).
+    
+    Handles:
+    - book: Full order book snapshot
+    - price_change: Incremental price level updates
+    
+    Gracefully handles events for removed markets.
+    """
     # Normalize single-event payloads into a list
     if isinstance(json_datas, dict):
         json_datas = [json_datas]
 
     for json_data in json_datas:
-        event_type = json_data['event_type']
-        asset = json_data['market']
+        event_type = json_data.get('event_type')
+        asset = json_data.get('market')
+        
+        if not asset or not event_type:
+            continue
 
+        # For 'book' events, always process - this is how we initially populate all_data
+        # For 'price_change' events, only process if we have existing book data
         if event_type == 'book':
             process_book_data(asset, json_data)
 
@@ -54,11 +68,14 @@ def process_data(json_datas, trade=True):
                 asyncio.create_task(perform_trade(asset))
                 
         elif event_type == 'price_change':
-            for data in json_data['price_changes']:
-                side = 'bids' if data['side'] == 'BUY' else 'asks'
-                price_level = float(data['price'])
-                new_size = float(data['size'])
-                # asset_id may be absent; only used to skip duplicate No-token updates
+            # Only process price changes if we have book data for this asset
+            if asset not in global_state.all_data:
+                continue
+                
+            for data in json_data.get('price_changes', []):
+                side = 'bids' if data.get('side') == 'BUY' else 'asks'
+                price_level = float(data.get('price', 0))
+                new_size = float(data.get('size', 0))
                 process_price_change(asset, side, price_level, new_size, data.get('asset_id'))
 
                 if trade:
@@ -86,80 +103,97 @@ def remove_from_performing(col, id):
         global_state.performing_timestamps[col].pop(id, None)
 
 def process_user_data(rows):
+    """
+    Process user-specific websocket events (trades and orders).
+    
+    Handles:
+    - Trade events: MATCHED, CONFIRMED, FAILED, MINED statuses
+    - Order events: Updates order tracking
+    
+    Thread-safe with graceful handling of removed markets.
+    """
     # Normalize single-event payloads into a list
     if isinstance(rows, dict):
         rows = [rows]
 
     for row in rows:
-        market = row['market']
+        market = row.get('market')
+        if not market:
+            continue
 
-        side = row['side'].lower()
-        token = row['asset_id']
+        side = row.get('side', '').lower()
+        token = row.get('asset_id')
+        
+        if not token:
+            continue
             
-        if token in global_state.REVERSE_TOKENS:     
-            col = token + "_" + side
+        # Check if this token is still being tracked (market might have been removed)
+        if token not in global_state.REVERSE_TOKENS:
+            # Token not in our tracked markets - might be from a removed market
+            # Just log and skip to avoid crashes
+            print(f"Received event for untracked token {token[:20]}... (market may have been removed)")
+            continue
+     
+        col = token + "_" + side
 
-            if row['event_type'] == 'trade':
-                size = 0
-                price = 0
-                maker_outcome = ""
-                taker_outcome = row['outcome']
+        if row['event_type'] == 'trade':
+            size = 0
+            price = 0
+            maker_outcome = ""
+            taker_outcome = row.get('outcome', '')
 
-                is_user_maker = False
-                for maker_order in row['maker_orders']:
-                    if maker_order['maker_address'].lower() == global_state.client.browser_wallet.lower():
-                        print("User is maker")
-                        size = float(maker_order['matched_amount'])
-                        price = float(maker_order['price'])
-                        
-                        is_user_maker = True
-                        maker_outcome = maker_order['outcome'] #this is curious
+            is_user_maker = False
+            for maker_order in row.get('maker_orders', []):
+                if maker_order.get('maker_address', '').lower() == global_state.client.browser_wallet.lower():
+                    print("User is maker")
+                    size = float(maker_order.get('matched_amount', 0))
+                    price = float(maker_order.get('price', 0))
+                    
+                    is_user_maker = True
+                    maker_outcome = maker_order.get('outcome', '')
 
-                        if maker_outcome == taker_outcome:
-                            side = 'buy' if side == 'sell' else 'sell' #need to reverse as we reverse token too
-                        else:
-                            token = global_state.REVERSE_TOKENS[token]
-                
-                if not is_user_maker:
-                    size = float(row['size'])
-                    price = float(row['price'])
-                    print("User is taker")
-
-                print("TRADE EVENT FOR: ", row['market'], "ID: ", row['id'], "STATUS: ", row['status'], " SIDE: ", row['side'], "  MAKER OUTCOME: ", maker_outcome, " TAKER OUTCOME: ", taker_outcome, " PROCESSED SIDE: ", side, " SIZE: ", size) 
-
-
-                if row['status'] == 'CONFIRMED' or row['status'] == 'FAILED' :
-                    if row['status'] == 'FAILED':
-                        print(f"Trade failed for {token}, decreasing")
-                        asyncio.create_task(asyncio.sleep(2))
-                        update_positions()
+                    if maker_outcome == taker_outcome:
+                        side = 'buy' if side == 'sell' else 'sell'
                     else:
-                        remove_from_performing(col, row['id'])
-                        print("Confirmed. Performing is ", len(global_state.performing[col]))
-                        print("Last trade update is ", global_state.last_trade_update)
-                        print("Performing is ", global_state.performing)
-                        print("Performing timestamps is ", global_state.performing_timestamps)
-                        
-                        asyncio.create_task(perform_trade(market))
+                        token = global_state.REVERSE_TOKENS.get(token, token)
+            
+            if not is_user_maker:
+                size = float(row.get('size', 0))
+                price = float(row.get('price', 0))
+                print("User is taker")
 
-                elif row['status'] == 'MATCHED':
-                    add_to_performing(col, row['id'])
+            print("TRADE EVENT FOR: ", row['market'], "ID: ", row.get('id'), "STATUS: ", row.get('status'), " SIDE: ", row.get('side'), "  MAKER OUTCOME: ", maker_outcome, " TAKER OUTCOME: ", taker_outcome, " PROCESSED SIDE: ", side, " SIZE: ", size) 
 
-                    print("Matched. Performing is ", len(global_state.performing[col]))
-                    set_position(token, side, size, price)
-                    print("Position after matching is ", global_state.positions[str(token)])
+            status = row.get('status', '')
+            if status == 'CONFIRMED' or status == 'FAILED':
+                if status == 'FAILED':
+                    print(f"Trade failed for {token}, decreasing")
+                    asyncio.create_task(asyncio.sleep(2))
+                    update_positions()
+                else:
+                    remove_from_performing(col, row.get('id'))
+                    print("Confirmed. Performing is ", len(global_state.performing.get(col, set())))
                     print("Last trade update is ", global_state.last_trade_update)
                     print("Performing is ", global_state.performing)
                     print("Performing timestamps is ", global_state.performing_timestamps)
+                    
                     asyncio.create_task(perform_trade(market))
-                elif row['status'] == 'MINED':
-                    remove_from_performing(col, row['id'])
 
-            elif row['event_type'] == 'order':
-                print("ORDER EVENT FOR: ", row['market'], " STATUS: ",  row['status'], " TYPE: ", row['type'], " SIDE: ", side, "  ORIGINAL SIZE: ", row['original_size'], " SIZE MATCHED: ", row['size_matched'])
-                
-                set_order(token, side, float(row['original_size']) - float(row['size_matched']), row['price'])
+            elif status == 'MATCHED':
+                add_to_performing(col, row.get('id'))
+
+                print("Matched. Performing is ", len(global_state.performing.get(col, set())))
+                set_position(token, side, size, price)
+                print("Position after matching is ", global_state.positions.get(str(token), {}))
+                print("Last trade update is ", global_state.last_trade_update)
+                print("Performing is ", global_state.performing)
+                print("Performing timestamps is ", global_state.performing_timestamps)
                 asyncio.create_task(perform_trade(market))
+            elif status == 'MINED':
+                remove_from_performing(col, row.get('id'))
 
-    else:
-        print(f"User date received for {market} but its not in")
+        elif row['event_type'] == 'order':
+            print("ORDER EVENT FOR: ", row['market'], " STATUS: ",  row.get('status'), " TYPE: ", row.get('type'), " SIDE: ", side, "  ORIGINAL SIZE: ", row.get('original_size'), " SIZE MATCHED: ", row.get('size_matched'))
+            
+            set_order(token, side, float(row.get('original_size', 0)) - float(row.get('size_matched', 0)), row.get('price', 0))
+            asyncio.create_task(perform_trade(market))

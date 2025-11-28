@@ -134,52 +134,117 @@ def get_order(token):
         return {'buy': {'price': 0, 'size': 0}, 'sell': {'price': 0, 'size': 0}}
     
 def set_order(token, side, size, price):
-    curr = {}
-    curr = {side: {'price': 0, 'size': 0}}
-
+    """
+    Update a single order (buy or sell) for a token WITHOUT overwriting the other side.
+    
+    This preserves existing orders on the opposite side when updating one side.
+    """
+    token = str(token)
+    side = side.lower()
+    
+    # Get existing orders for this token, or create new structure
+    if token in global_state.orders:
+        curr = global_state.orders[token].copy()
+    else:
+        curr = {'buy': {'price': 0, 'size': 0}, 'sell': {'price': 0, 'size': 0}}
+    
+    # Ensure both sides exist
+    if 'buy' not in curr:
+        curr['buy'] = {'price': 0, 'size': 0}
+    if 'sell' not in curr:
+        curr['sell'] = {'price': 0, 'size': 0}
+    
+    # Update only the specified side
     curr[side]['size'] = float(size)
     curr[side]['price'] = float(price)
-
-    global_state.orders[str(token)] = curr
-    print("Updated order, set to ", curr)
+    
+    global_state.orders[token] = curr
+    print(f"Updated order for {token[:20]}... {side}: price={price}, size={size}")
 
     
 
 def update_markets():
-    received_df, received_params = get_sheet_df()
+    """
+    Update market data from Google Sheets.
+    
+    This function:
+    1. Fetches the latest Selected Markets from Google Sheets
+    2. Updates global state with new market data
+    3. Tracks new tokens for websocket subscription
+    4. Cleans up removed markets from tracking
+    
+    Thread-safe: Uses global_state.lock for atomic updates.
+    """
+    try:
+        received_df, received_params = get_sheet_df()
+    except Exception as e:
+        print(f"Warning: Failed to fetch sheet data: {e}")
+        return
 
-    if len(received_df) > 0:
-        global_state.df, global_state.params = received_df.copy(), received_params
-    else:
+    if received_df is None or len(received_df) == 0:
         print("Warning: Received empty Selected/All Markets merge; skipping update_markets")
         return
 
     required_cols = {'token1', 'token2', 'question'}
-    missing = required_cols - set(global_state.df.columns)
+    missing = required_cols - set(received_df.columns)
     if missing:
         print(f"Warning: update_markets missing required columns {missing}; skipping update.")
         return
     
-    new_tokens_added = False
+    # Use lock for thread-safe updates
+    with global_state.lock:
+        # Track which tokens are currently active
+        current_tokens = set()
+        for _, row in received_df.iterrows():
+            current_tokens.add(str(row['token1']))
+            current_tokens.add(str(row['token2']))
+        
+        # Detect removed markets (tokens that were tracked but no longer in sheet)
+        previous_tokens = set(global_state.all_tokens)
+        removed_tokens = previous_tokens - current_tokens
+        if removed_tokens:
+            print(f"Markets removed: {len(removed_tokens)} tokens no longer in Selected Markets")
+            # Clean up orders dict for removed tokens
+            for token in removed_tokens:
+                if token in global_state.orders:
+                    del global_state.orders[token]
+                # Remove from performing tracking
+                for suffix in ['_buy', '_sell']:
+                    col = f"{token}{suffix}"
+                    if col in global_state.performing:
+                        del global_state.performing[col]
+                    if col in global_state.performing_timestamps:
+                        del global_state.performing_timestamps[col]
+        
+        # Update the dataframe and params
+        global_state.df = received_df.copy()
+        global_state.params = received_params
+        
+        new_tokens_added = False
 
-    for _, row in global_state.df.iterrows():
-        for col in ['token1', 'token2']:
-            row[col] = str(row[col])
+        for _, row in global_state.df.iterrows():
+            token1 = str(row['token1'])
+            token2 = str(row['token2'])
 
-        if row['token1'] not in global_state.all_tokens:
-            global_state.all_tokens.append(row['token1'])
-            new_tokens_added = True
+            if token1 not in global_state.all_tokens:
+                global_state.all_tokens.append(token1)
+                new_tokens_added = True
 
-        if row['token1'] not in global_state.REVERSE_TOKENS:
-            global_state.REVERSE_TOKENS[row['token1']] = row['token2']
+            if token1 not in global_state.REVERSE_TOKENS:
+                global_state.REVERSE_TOKENS[token1] = token2
 
-        if row['token2'] not in global_state.REVERSE_TOKENS:
-            global_state.REVERSE_TOKENS[row['token2']] = row['token1']
+            if token2 not in global_state.REVERSE_TOKENS:
+                global_state.REVERSE_TOKENS[token2] = token1
 
-        for col2 in [f"{row['token1']}_buy", f"{row['token1']}_sell", f"{row['token2']}_buy", f"{row['token2']}_sell"]:
-            if col2 not in global_state.performing:
-                global_state.performing[col2] = set()
+            for col2 in [f"{token1}_buy", f"{token1}_sell", f"{token2}_buy", f"{token2}_sell"]:
+                if col2 not in global_state.performing:
+                    global_state.performing[col2] = set()
+                if col2 not in global_state.performing_timestamps:
+                    global_state.performing_timestamps[col2] = {}
 
-    if new_tokens_added:
-        global_state.market_tokens_version += 1
-        print(f"New markets detected. Subscription version is now {global_state.market_tokens_version}. Total tokens: {len(global_state.all_tokens)}")
+        # If tokens were removed OR added, bump version to trigger websocket reconnect
+        if new_tokens_added or removed_tokens:
+            # Rebuild all_tokens to only include current tokens
+            global_state.all_tokens = list(current_tokens)
+            global_state.market_tokens_version += 1
+            print(f"Market subscription version is now {global_state.market_tokens_version}. Total tokens: {len(global_state.all_tokens)}")

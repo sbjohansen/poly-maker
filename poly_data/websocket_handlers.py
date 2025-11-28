@@ -2,6 +2,7 @@ import asyncio                      # Asynchronous I/O
 import json                        # JSON handling
 import websockets                  # WebSocket client
 import traceback                   # Exception handling
+import time                        # For heartbeat timing
 
 from poly_data.data_processing import process_data, process_user_data
 import poly_data.global_state as global_state
@@ -35,9 +36,21 @@ async def connect_market_websocket(chunk, version=None):
 
         try:
             # Process incoming market data indefinitely
+            msg_count = 0
+            last_heartbeat = time.time()
+            
             while True:
                 message = await websocket.recv()
                 json_data = json.loads(message)
+                msg_count += 1
+                
+                # Heartbeat log every 60 seconds to show bot is alive
+                now = time.time()
+                if now - last_heartbeat >= 60:
+                    print(f"[Heartbeat] Received {msg_count} market updates in last 60s. Tracking {len(global_state.all_tokens)} tokens.")
+                    msg_count = 0
+                    last_heartbeat = now
+                
                 # Process order book updates and trigger trading as needed
                 process_data(json_data)
 

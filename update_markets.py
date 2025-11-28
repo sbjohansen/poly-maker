@@ -315,6 +315,62 @@ def _compute_order_book_depth_score(row):
         return volume_score
 
 
+def _compute_reward_qualification_score(row):
+    """
+    Score based on whether we can actually qualify for rewards.
+    
+    Polymarket requires:
+    1. Orders within max_spread of midpoint
+    2. Orders above min_size
+    3. If midpoint < 0.10, need orders on BOTH sides
+    
+    Markets where we can easily qualify get higher scores.
+    """
+    try:
+        best_bid = float(row.get("best_bid", 0) or 0)
+        best_ask = float(row.get("best_ask", 1) or 1)
+        spread = float(row.get("spread", 1) or 1)
+        max_spread = float(row.get("max_spread", 3) or 3) / 100  # Convert cents to decimal
+        min_size = float(row.get("min_size", 10) or 10)
+        gm_reward = float(row.get("gm_reward_per_100", 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+    
+    midpoint = (best_bid + best_ask) / 2
+    
+    # Can we place orders within max_spread?
+    # Current spread must be <= 2 * max_spread to have room for both sides
+    if spread > max_spread * 2:
+        # Very wide spread - hard to get both sides within max_spread
+        return 0.2
+    
+    # Is min_size reasonable for our trade size?
+    trade_size = float(os.getenv("AUTO_DEFAULT_TRADE_SIZE", "40"))
+    if min_size > trade_size * 1.5:
+        # min_size too high for us
+        return 0.3
+    
+    # Low midpoint markets need BOTH sides - more capital intensive
+    if midpoint < 0.10:
+        # Need to quote both sides - reduce score slightly
+        return 0.7
+    
+    # Calculate Q-score potential
+    # Best case: we place 1 tick from midpoint
+    tick = float(row.get("tick_size", 0.01) or 0.01)
+    best_spread_from_mid = tick  # 1 tick from midpoint
+    
+    # Quadratic scoring: ((max_spread - our_spread) / max_spread)^2
+    if best_spread_from_mid < max_spread:
+        q_score_potential = ((max_spread - best_spread_from_mid) / max_spread) ** 2
+    else:
+        q_score_potential = 0
+    
+    # Combine Q-score potential with actual reward
+    # This gives preference to markets where we can get HIGH Q-scores AND high rewards
+    return q_score_potential * min(gm_reward / 3, 1.0)
+
+
 def _compute_reward_efficiency_score(row):
     """
     Score based on reward relative to volatility (risk-adjusted return).
@@ -353,6 +409,7 @@ def compute_market_score(row, hyperparams=None):
     - Price proximity to favorable ranges
     - Reward efficiency (reward per unit risk)
     - Order book depth / market activity
+    - Reward qualification (can we actually earn rewards in this market?)
 
     Returns a composite score where higher is better.
     """
@@ -374,7 +431,8 @@ def compute_market_score(row, hyperparams=None):
     liquidity_score = _compute_liquidity_score(spread, best_bid, best_ask)
     volatility_score = _compute_volatility_score(row)
     efficiency_score = _compute_reward_efficiency_score(row)
-    depth_score = _compute_order_book_depth_score(row)  # NEW: order book depth
+    depth_score = _compute_order_book_depth_score(row)
+    qualification_score = _compute_reward_qualification_score(row)  # NEW: can we earn rewards?
 
     # Weighted composite score
     # Primary factor: reward (normalized to ~0-5 range by dividing by typical max)
@@ -384,7 +442,8 @@ def compute_market_score(row, hyperparams=None):
         AUTO_REWARD_WEIGHT * reward_normalized
         + AUTO_PRICE_PROXIMITY_WEIGHT * price_score
         + AUTO_LIQUIDITY_WEIGHT * liquidity_score
-        + AUTO_LIQUIDITY_WEIGHT * depth_score  # NEW: factor in order book depth
+        + AUTO_LIQUIDITY_WEIGHT * depth_score
+        + AUTO_REWARD_WEIGHT * qualification_score  # Weight Q-score potential like rewards
         + volatility_score  # Already includes penalty
         - AUTO_VOL_WEIGHT * (vol_sum / 50.0)  # Normalized volatility penalty
         - AUTO_SPREAD_WEIGHT * (spread / 0.1)  # Normalized spread penalty
@@ -398,38 +457,40 @@ def _cancel_orders_for_market(client, condition_id, token1=None, token2=None):
     Cancel all open orders for a market before removing it from Selected Markets.
     
     Tries multiple approaches:
-    1. Cancel by market ID (condition_id)
-    2. Cancel by individual token IDs (token1, token2) if provided
+    1. Cancel by market ID (condition_id) using cancel_market_orders(market=...)
+    2. Cancel by individual token IDs (token1, token2) using cancel_market_orders(asset_id=...)
+    
+    Note: The raw ClobClient uses cancel_market_orders(), not cancel_all_market().
     """
     if client is None:
         return
     
     cancelled = False
     
-    # Try cancelling by market ID first
+    # Try cancelling by market ID first (using raw ClobClient method)
     try:
-        client.cancel_all_market(str(condition_id))
+        client.cancel_market_orders(market=str(condition_id))
         print(f"Cancelled all orders for market {condition_id}")
         cancelled = True
     except Exception as ex:
-        print(f"Warning: cancel_all_market failed for {condition_id}: {ex}")
+        print(f"Warning: cancel_market_orders(market=) failed for {condition_id}: {ex}")
     
-    # Also try cancelling by individual tokens if provided
+    # Also try cancelling by individual tokens if provided (using raw ClobClient method)
     if token1:
         try:
-            client.cancel_all_asset(str(token1))
+            client.cancel_market_orders(asset_id=str(token1))
             print(f"  Cancelled orders for token1: {token1[:20]}...")
             cancelled = True
         except Exception as ex:
-            pass  # Silent - may have no orders for this token
+            print(f"  Warning: cancel_market_orders(asset_id=) failed for token1: {ex}")
     
     if token2:
         try:
-            client.cancel_all_asset(str(token2))
+            client.cancel_market_orders(asset_id=str(token2))
             print(f"  Cancelled orders for token2: {token2[:20]}...")
             cancelled = True
         except Exception as ex:
-            pass  # Silent - may have no orders for this token
+            print(f"  Warning: cancel_market_orders(asset_id=) failed for token2: {ex}")
     
     if not cancelled:
         print(f"Warning: could not cancel any orders for market {condition_id}")
@@ -580,14 +641,20 @@ def auto_manage_selected_markets(new_df, worksheet, client, hyperparams=None):
     # Determine markets where we're currently active (positions or orders)
     active_markets = set()
     if client is not None:
+        # Fetch positions via direct API (raw ClobClient doesn't have get_all_positions)
         try:
-            positions = client.get_all_positions()
-            if "condition_id" in positions.columns:
-                active_markets.update(positions["condition_id"].astype(str))
+            import requests
+            browser_address = os.getenv("BROWSER_ADDRESS", "")
+            if browser_address:
+                res = requests.get(f'https://data-api.polymarket.com/positions?user={browser_address}')
+                positions = pd.DataFrame(res.json())
+                if "condition_id" in positions.columns:
+                    active_markets.update(positions["condition_id"].astype(str))
         except Exception as ex:
             print(f"Warning: could not fetch positions for active check: {ex}")
+        # Fetch open orders via raw ClobClient (uses get_orders(), not get_all_orders())
         try:
-            open_orders = client.get_all_orders()
+            open_orders = pd.DataFrame(client.get_orders())
             if "market" in open_orders.columns:
                 active_markets.update(open_orders["market"].astype(str))
             elif "condition_id" in open_orders.columns:
@@ -825,7 +892,29 @@ def fetch_and_process_data():
     hyperparams = load_hyperparameters(spreadsheet)
 
     all_df = get_all_markets(client)
-    print("Got all Markets")
+    print(f"Got all Markets: {len(all_df)} total")
+    
+    # Early filter: skip markets with very low rewards before fetching order books
+    # This significantly reduces API calls
+    min_daily_rate = float(os.getenv("AUTO_MIN_DAILY_RATE", "0.5"))
+    if 'rewards' in all_df.columns:
+        # Extract daily rate from nested rewards dict
+        def get_daily_rate(rewards):
+            try:
+                if isinstance(rewards, dict) and 'rates' in rewards:
+                    for rate_info in rewards['rates']:
+                        if rate_info.get('asset_address', '').lower() == '0x2791bca1f2de4661ed88a30c99a7a9449aa84174':
+                            return float(rate_info.get('rewards_daily_rate', 0))
+                return 0
+            except:
+                return 0
+        
+        all_df['_daily_rate'] = all_df['rewards'].apply(get_daily_rate)
+        before_filter = len(all_df)
+        all_df = all_df[all_df['_daily_rate'] >= min_daily_rate]
+        print(f"Early filter: {before_filter} -> {len(all_df)} markets (>= {min_daily_rate} daily rate)")
+        all_df = all_df.drop(columns=['_daily_rate'])
+    
     all_results = get_all_results(all_df, client)
     print("Got all Results")
     m_data, all_markets = get_markets(all_results, sel_df, maker_reward=0.75)
@@ -899,9 +988,35 @@ def fetch_and_process_data():
             m_data[col] = m_data[col].astype(str)
 
     if len(new_df) > 50:
-        update_sheet(new_df, wk_all)
-        update_sheet(volatility_df, wk_vol)
-        update_sheet(m_data, wk_full)
+        # Update sheets in parallel for faster processing
+        import concurrent.futures
+        
+        def update_all_sheet():
+            update_sheet(new_df, wk_all)
+            return "All Markets"
+        
+        def update_vol_sheet():
+            update_sheet(volatility_df, wk_vol)
+            return "Volatility Markets"
+        
+        def update_full_sheet():
+            update_sheet(m_data, wk_full)
+            return "Full Markets"
+        
+        print("Updating sheets in parallel...")
+        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+            sheet_futures = [
+                executor.submit(update_all_sheet),
+                executor.submit(update_vol_sheet),
+                executor.submit(update_full_sheet),
+            ]
+            for future in concurrent.futures.as_completed(sheet_futures):
+                try:
+                    sheet_name = future.result()
+                    print(f"  Updated {sheet_name}")
+                except Exception as ex:
+                    print(f"  Sheet update error: {ex}")
+        
         if AUTO_MANAGE_SELECTED:
             auto_manage_selected_markets(new_df, wk_selected, client, hyperparams)
     else:
