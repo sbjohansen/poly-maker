@@ -346,12 +346,46 @@ def compute_market_score(row, hyperparams=None):
     return composite
 
 
-def _cancel_orders_for_market(client, condition_id):
+def _cancel_orders_for_market(client, condition_id, token1=None, token2=None):
+    """
+    Cancel all open orders for a market before removing it from Selected Markets.
+    
+    Tries multiple approaches:
+    1. Cancel by market ID (condition_id)
+    2. Cancel by individual token IDs (token1, token2) if provided
+    """
+    if client is None:
+        return
+    
+    cancelled = False
+    
+    # Try cancelling by market ID first
     try:
-        client.cancel_market_orders(market=str(condition_id))
-        print(f"Cancelled orders for market {condition_id}")
+        client.cancel_all_market(str(condition_id))
+        print(f"Cancelled all orders for market {condition_id}")
+        cancelled = True
     except Exception as ex:
-        print(f"Warning: could not cancel orders for {condition_id}: {ex}")
+        print(f"Warning: cancel_all_market failed for {condition_id}: {ex}")
+    
+    # Also try cancelling by individual tokens if provided
+    if token1:
+        try:
+            client.cancel_all_asset(str(token1))
+            print(f"  Cancelled orders for token1: {token1[:20]}...")
+            cancelled = True
+        except Exception as ex:
+            pass  # Silent - may have no orders for this token
+    
+    if token2:
+        try:
+            client.cancel_all_asset(str(token2))
+            print(f"  Cancelled orders for token2: {token2[:20]}...")
+            cancelled = True
+        except Exception as ex:
+            pass  # Silent - may have no orders for this token
+    
+    if not cancelled:
+        print(f"Warning: could not cancel any orders for market {condition_id}")
 
 
 def _build_row_from_candidate(row, columns):
@@ -462,8 +496,11 @@ def auto_manage_selected_markets(new_df, worksheet, client, hyperparams=None):
     if AUTO_RESET_SELECTED:
         print("AUTO_RESET_SELECTED enabled; clearing Selected Markets and rebuilding.")
         if client is not None and "condition_id" in current_sel.columns:
-            for cid in current_sel["condition_id"].astype(str):
-                _cancel_orders_for_market(client, cid)
+            for _, row in current_sel.iterrows():
+                cid = str(row.get("condition_id", ""))
+                t1 = str(row.get("token1", "")) if "token1" in row else None
+                t2 = str(row.get("token2", "")) if "token2" in row else None
+                _cancel_orders_for_market(client, cid, t1, t2)
         current_sel = pd.DataFrame(columns=sel_columns)
 
     # Update activity map with the latest book data
@@ -540,10 +577,12 @@ def auto_manage_selected_markets(new_df, worksheet, client, hyperparams=None):
         best_bid = float(row.get("best_bid", 0) or 0)
         best_ask = float(row.get("best_ask", 1) or 1)
         spread = float(row.get("spread", 1) or 1)
-        
+
         no_liquidity = (best_bid == 0) and (best_ask == 0)
-        low_liquidity = (best_bid < AUTO_MIN_BID) or (best_ask > AUTO_MAX_ASK) or (spread > AUTO_MAX_SPREAD)
-        
+        low_liquidity = (
+            (best_bid < AUTO_MIN_BID) or (best_ask > AUTO_MAX_ASK) or (spread > AUTO_MAX_SPREAD)
+        )
+
         reward_low = reward_val < AUTO_MIN_GM_REWARD
         high_short_term_vol = vol_3h > AUTO_MAX_3HR_VOLATILITY
 
@@ -572,8 +611,12 @@ def auto_manage_selected_markets(new_df, worksheet, client, hyperparams=None):
         for cid in stale_ids:
             print(f"  - {cid}: {removal_reasons.get(cid, 'unknown reason')}")
         if client is not None:
+            # Cancel orders for each removed market using both market ID and token IDs
             for cid in stale_ids:
-                _cancel_orders_for_market(client, cid)
+                row = current_sel[current_sel["condition_id"].astype(str) == cid]
+                t1 = str(row["token1"].iloc[0]) if len(row) > 0 and "token1" in row.columns else None
+                t2 = str(row["token2"].iloc[0]) if len(row) > 0 and "token2" in row.columns else None
+                _cancel_orders_for_market(client, cid, t1, t2)
         # Remove stale rows
         current_sel = current_sel[~current_sel["condition_id"].astype(str).isin(stale_ids)]
 
@@ -591,8 +634,12 @@ def auto_manage_selected_markets(new_df, worksheet, client, hyperparams=None):
                 f"Auto-manage: trimming {len(drop_ids)} market(s) to enforce cap (keeping top {AUTO_MAX_MARKETS})"
             )
             if client is not None:
+                # Cancel orders for each trimmed market using both market ID and token IDs
                 for cid in drop_ids:
-                    _cancel_orders_for_market(client, cid)
+                    row = current_sel[current_sel["condition_id"].astype(str) == cid]
+                    t1 = str(row["token1"].iloc[0]) if len(row) > 0 and "token1" in row.columns else None
+                    t2 = str(row["token2"].iloc[0]) if len(row) > 0 and "token2" in row.columns else None
+                    _cancel_orders_for_market(client, cid, t1, t2)
             current_sel = current_sel[current_sel["condition_id"].astype(str).isin(keep)]
 
     # Compute how many slots are open
@@ -612,17 +659,18 @@ def auto_manage_selected_markets(new_df, worksheet, client, hyperparams=None):
     # Filter out illiquid markets with stricter liquidity requirements
     # Must have real bid (not just 0.01) and real ask (not just 0.99)
     candidates = candidates[
-        (candidates["best_bid"] >= AUTO_MIN_BID) &
-        (candidates["best_ask"] <= AUTO_MAX_ASK)
+        (candidates["best_bid"] >= AUTO_MIN_BID) & (candidates["best_ask"] <= AUTO_MAX_ASK)
     ]
-    
+
     # Filter out markets with spreads too wide (illiquid)
     if "spread" in candidates.columns:
         spread_numeric = pd.to_numeric(candidates["spread"], errors="coerce")
         candidates = candidates[spread_numeric <= AUTO_MAX_SPREAD]
-        
+
     # Log how many candidates remain after liquidity filter
-    print(f"Auto-manage: {len(candidates)} candidates after liquidity filter (bid>={AUTO_MIN_BID}, ask<={AUTO_MAX_ASK}, spread<={AUTO_MAX_SPREAD})")
+    print(
+        f"Auto-manage: {len(candidates)} candidates after liquidity filter (bid>={AUTO_MIN_BID}, ask<={AUTO_MAX_ASK}, spread<={AUTO_MAX_SPREAD})"
+    )
 
     # Skip markets where the minimum size is far above our trade size
     if "min_size" in candidates.columns:

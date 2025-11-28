@@ -381,7 +381,9 @@ async def perform_trade(market):
 
                 # Skip this token if no liquidity (bid or ask is None)
                 if best_bid is None or best_ask is None or top_bid is None or top_ask is None:
-                    print(f"Skipping {detail['answer']} - no liquidity (bid={best_bid}, ask={best_ask})")
+                    print(
+                        f"Skipping {detail['answer']} - no liquidity (bid={best_bid}, ask={best_ask})"
+                    )
                     continue
 
                 # Round prices to appropriate precision
