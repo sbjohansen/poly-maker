@@ -193,80 +193,28 @@ def find_best_price_with_size(price_dict, min_size, reverse=False):
 
 def get_order_prices(best_bid, best_bid_size, top_bid, best_ask, best_ask_size, top_ask, avgPrice, row):
     """
-    Calculate optimal bid and ask prices for market making, OPTIMIZED FOR LIQUIDITY REWARDS.
+    Calculate bid and ask prices for market making.
     
-    Polymarket's reward formula: S(v,s) = ((v - s) / v)^2 * size
-    - v = max_spread (e.g., 3 cents)
-    - s = distance from midpoint
-    - KEY INSIGHT: Quadratic scoring means being CLOSER to midpoint is exponentially better!
-    
-    Strategy:
-    1. Calculate midpoint
-    2. Place orders as close to midpoint as possible (to maximize Q-score)
-    3. Don't cross the spread
-    4. Stay within max_spread to qualify for rewards
+    Simple strategy that was working well:
+    1. Improve best bid/ask by 1 tick to get priority
+    2. If best price has low size, just match it
+    3. Safety checks to avoid crossing spread
     """
     tick = row['tick_size']
-    spread = best_ask - best_bid
-    midpoint = (best_bid + best_ask) / 2
+    min_size = row['min_size']
     
-    # Get max_spread from row (stored in cents in sheet, convert to decimal)
-    # max_spread in row is typically 1-5 (cents), we need 0.01-0.05 (decimal)
-    max_spread_cents = float(row.get('max_spread', 3))  # Default 3 cents
-    max_spread = max_spread_cents / 100  # Convert to decimal
-    
-    # === REWARD-OPTIMIZED PRICING ===
-    # For maximum rewards, we want to be as close to midpoint as possible
-    # But we need to stay on our side of the spread
-    
-    # Calculate the ideal reward-optimal prices (1 tick from midpoint)
-    reward_optimal_bid = midpoint - tick
-    reward_optimal_ask = midpoint + tick
-    
-    # Calculate Q-scores for different price levels to understand tradeoffs
-    # (This is for logging/debugging - helps understand reward potential)
-    bid_spread_from_mid = midpoint - reward_optimal_bid
-    ask_spread_from_mid = reward_optimal_ask - midpoint
-    
-    # Default to reward-optimal prices
-    bid_price = reward_optimal_bid
-    ask_price = reward_optimal_ask
-    
-    # === COMPETE WITH EXISTING ORDERS ===
-    # If someone is already closer to midpoint, we need to match or beat them
-    if best_bid > reward_optimal_bid:
-        # There's a better bid - we need to at least match it, or improve by 1 tick
-        bid_price = best_bid + tick
-        # But don't cross midpoint
-        if bid_price >= midpoint:
-            bid_price = best_bid  # Just match if we'd cross
-    
-    if best_ask < reward_optimal_ask:
-        # There's a better ask - we need to match or improve
-        ask_price = best_ask - tick
-        if ask_price <= midpoint:
-            ask_price = best_ask  # Just match if we'd cross
-    
-    # === SPREAD TOO TIGHT ===
-    # If spread is only 1-2 ticks, we can't improve - just match best
-    if spread <= tick * 2:
+    # Default: improve best bid/ask by 1 tick
+    bid_price = best_bid + tick
+    ask_price = best_ask - tick
+
+    # If the best bid has low size, just match it (don't overpay)
+    if best_bid_size < min_size * 1.5:
         bid_price = best_bid
+
+    # If the best ask has low size, just match it
+    if best_ask_size < min_size * 1.5:
         ask_price = best_ask
-    elif spread <= tick * 3:
-        # Very tight - be at best price, don't try to improve
-        bid_price = min(bid_price, best_bid + tick)
-        ask_price = max(ask_price, best_ask - tick)
-    
-    # === ENSURE ORDERS QUALIFY FOR REWARDS ===
-    # Must be within max_spread of midpoint
-    if midpoint - bid_price > max_spread:
-        # Bid too far from midpoint - move it closer
-        bid_price = midpoint - max_spread + tick
-    
-    if ask_price - midpoint > max_spread:
-        # Ask too far from midpoint - move it closer  
-        ask_price = midpoint + max_spread - tick
-    
+
     # === SAFETY: NEVER CROSS THE SPREAD ===
     if bid_price >= top_ask:
         bid_price = top_bid
@@ -277,21 +225,18 @@ def get_order_prices(best_bid, best_bid_size, top_bid, best_ask, best_ask_size, 
     if bid_price >= ask_price:
         bid_price = top_bid
         ask_price = top_ask
+
+    # === LOG Q-SCORE FOR VISIBILITY (but don't change pricing) ===
+    midpoint = (best_bid + best_ask) / 2
+    max_spread_cents = float(row.get('max_spread', 3))
+    max_spread = max_spread_cents / 100
     
-    # === ENSURE MINIMUM PROFIT ON SELLS ===
-    # Never sell below our average cost
-    if ask_price <= avgPrice and avgPrice > 0:
-        ask_price = avgPrice
-    
-    # === LOG REWARD POTENTIAL ===
-    # Calculate Q-scores for final prices (for visibility)
     final_bid_spread = abs(midpoint - bid_price)
     final_ask_spread = abs(ask_price - midpoint)
     
-    bid_q_score = calculate_q_score(final_bid_spread, max_spread, 100)  # Per 100 shares
+    bid_q_score = calculate_q_score(final_bid_spread, max_spread, 100)
     ask_q_score = calculate_q_score(final_ask_spread, max_spread, 100)
     
-    # Only log if in debug mode or first time
     if bid_q_score > 0 or ask_q_score > 0:
         print(f"  Reward Q-scores: bid={bid_q_score:.2f} (spread={final_bid_spread:.3f}), "
               f"ask={ask_q_score:.2f} (spread={final_ask_spread:.3f}), max_spread={max_spread:.3f}")
@@ -310,62 +255,41 @@ def round_up(number, decimals):
     return math.ceil(number * factor) / factor
 
 def get_buy_sell_amount(position, bid_price, row, other_token_position=0):
+    """
+    Calculate buy and sell amounts based on current position.
+    
+    Original logic from repo - simple and proven to work:
+    - Buy when below max_size
+    - Sell when we have position >= trade_size
+    """
     buy_amount = 0
     sell_amount = 0
 
-    # Get max_size, defaulting to trade_size if not specified
     max_size = row.get('max_size', row['trade_size'])
     trade_size = row['trade_size']
     min_size = row['min_size']
     
-    # Calculate total exposure across both sides
-    total_exposure = position + other_token_position
-    
-    # === BUY LOGIC ===
-    # For TWO-SIDED QUOTING (maximize rewards), we want buy orders even at max position
-    # Qmin = min(Qbid, Qask) - need both sides for rewards!
     if position < max_size:
-        # Calculate how much room we have
+        # Below max - calculate buy amount
         remaining_to_max = max_size - position
+        buy_amount = min(trade_size, remaining_to_max)
         
-        # If we have less than 50% of max_size, be MORE aggressive
-        if position < max_size * 0.5:
-            buy_amount = min(trade_size, remaining_to_max)
-        elif position < max_size * 0.8:
-            buy_amount = min(trade_size, remaining_to_max)
+        # Only sell if we have enough position
+        if position >= trade_size:
+            sell_amount = trade_size
         else:
-            # Near max - be more conservative with buys
-            buy_amount = min(trade_size * 0.5, remaining_to_max)
+            sell_amount = 0
     else:
-        # At max_size - STILL keep a buy quote for two-sided rewards
-        # This order provides liquidity for rewards even if we're at max position
-        # If it fills, we can sell from our position (net neutral on inventory)
-        if total_exposure < max_size * 2.0:  # Allow full exposure on both sides
-            buy_amount = min_size  # Minimum size to qualify for rewards
-        else:
-            buy_amount = 0
-    
-    # === SELL LOGIC ===
-    # CRITICAL: Only sell if we actually HAVE a position to sell!
-    # Cannot sell tokens we don't own
-    if position >= min_size:
-        # We have enough position to meet minimum order size
+        # At or above max position - focus on selling, no buying
         sell_amount = min(position, trade_size)
-    elif position > 0 and position >= min_size * 0.7:
-        # We have a small position - round up to min_size
-        sell_amount = min_size
-    else:
-        # No position or too small - cannot sell
-        sell_amount = 0
+        buy_amount = 0  # Don't buy when at/over max_size
 
-    # === ENSURE MINIMUM SIZE COMPLIANCE ===
+    # Ensure minimum size compliance
     if buy_amount > 0 and buy_amount < min_size:
-        if buy_amount >= min_size * 0.7:
-            buy_amount = min_size
-        else:
-            buy_amount = 0
+        buy_amount = min_size
     
-    # sell_amount already handled above
+    if sell_amount > 0 and sell_amount < min_size:
+        sell_amount = 0  # Don't place sell orders below min_size
 
     # Apply multiplier for low-priced assets
     if bid_price < 0.1 and buy_amount > 0:
