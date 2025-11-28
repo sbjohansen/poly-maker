@@ -167,10 +167,46 @@ def _build_row_from_candidate(row, columns):
     return base
 
 
-def auto_manage_selected_markets(new_df, worksheet, client):
+def load_hyperparameters(spreadsheet):
+    """
+    Load hyperparameters (type -> param -> value) from the Google Sheet.
+    """
+    hyper = {}
+    try:
+        wk = spreadsheet.worksheet("Hyperparameters")
+        records = wk.get_all_records()
+    except Exception as ex:
+        print(f"Warning: could not fetch Hyperparameters sheet: {ex}")
+        return hyper
+
+    current_type = None
+    for record in records:
+        type_val = record.get("type")
+        if type_val and str(type_val).strip() and str(type_val).lower() != "nan":
+            current_type = str(type_val).strip()
+        if not current_type:
+            continue
+        param = record.get("param")
+        value = record.get("value")
+        if param is None:
+            continue
+        try:
+            if isinstance(value, str) and value.replace(".", "", 1).replace("-", "", 1).isdigit():
+                value = float(value)
+            elif isinstance(value, (int, float)):
+                value = float(value)
+        except Exception:
+            pass
+        hyper.setdefault(current_type, {})[param] = value
+    return hyper
+
+
+def auto_manage_selected_markets(new_df, worksheet, client, hyperparams=None):
     """
     Keep Selected Markets capped, add top candidates, remove stale ones (after cancelling orders).
     """
+    if hyperparams is None:
+        hyperparams = {}
     try:
         current_sel = pd.DataFrame(worksheet.get_all_records())
     except Exception as ex:
@@ -208,11 +244,31 @@ def auto_manage_selected_markets(new_df, worksheet, client):
     stats_cols = ["condition_id", "gm_reward_per_100", "best_bid", "best_ask"]
     merged = current_sel.merge(new_df[stats_cols], on="condition_id", how="left", suffixes=("", "_stats"))
 
+    # Determine markets where we're currently active (positions or orders)
+    active_markets = set()
+    if client is not None:
+        try:
+            positions = client.get_all_positions()
+            if "condition_id" in positions.columns:
+                active_markets.update(positions["condition_id"].astype(str))
+        except Exception as ex:
+            print(f"Warning: could not fetch positions for active check: {ex}")
+        try:
+            open_orders = client.get_all_orders()
+            if "market" in open_orders.columns:
+                active_markets.update(open_orders["market"].astype(str))
+            elif "condition_id" in open_orders.columns:
+                active_markets.update(open_orders["condition_id"].astype(str))
+        except Exception as ex:
+            print(f"Warning: could not fetch orders for active check: {ex}")
+
     stale_ids = []
     for _, row in merged.iterrows():
         cid = str(row.get("condition_id", ""))
         if not cid:
             continue
+        if cid in active_markets:
+            continue  # Don't remove markets with active trades
         last_seen = float(activity_map.get(cid, now))
         time_stale = (now - last_seen) > (AUTO_STALE_HOURS * 3600)
 
@@ -267,6 +323,17 @@ def auto_manage_selected_markets(new_df, worksheet, client):
     if "min_size" in candidates.columns:
         min_size_numeric = pd.to_numeric(candidates["min_size"], errors="coerce")
         candidates = candidates[min_size_numeric <= AUTO_DEFAULT_TRADE_SIZE * AUTO_MIN_SIZE_MULT]
+
+    # Filter on volatility threshold based on chosen parameter type
+    param_cfg = hyperparams.get(AUTO_PARAM_TYPE, {}) if hyperparams else {}
+    vol_threshold = param_cfg.get("volatility_threshold")
+    try:
+        vol_threshold = float(vol_threshold)
+    except (TypeError, ValueError):
+        vol_threshold = None
+    if vol_threshold is not None and "3_hour" in candidates.columns:
+        vol_numeric = pd.to_numeric(candidates["3_hour"], errors="coerce")
+        candidates = candidates[vol_numeric <= vol_threshold]
 
     # Score candidates: reward minus penalties for volatility and spread
     def compute_score(row):
@@ -334,6 +401,7 @@ def fetch_and_process_data():
     wk_full = spreadsheet.worksheet("Full Markets")
 
     sel_df = get_sel_df(spreadsheet, "Selected Markets")
+    hyperparams = load_hyperparameters(spreadsheet)
 
 
     all_df = get_all_markets(client)
@@ -378,7 +446,7 @@ def fetch_and_process_data():
         update_sheet(volatility_df, wk_vol)
         update_sheet(m_data, wk_full)
         if AUTO_MANAGE_SELECTED:
-            auto_manage_selected_markets(new_df, wk_selected, client)
+            auto_manage_selected_markets(new_df, wk_selected, client, hyperparams)
     else:
         print(f'{pd.to_datetime("now")}: Not updating sheet because of length {len(new_df)}.')
 
