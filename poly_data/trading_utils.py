@@ -107,32 +107,55 @@ def find_best_price_with_size(price_dict, min_size, reverse=False):
     return best_price, best_size, second_best_price, second_best_size, top_price
 
 def get_order_prices(best_bid, best_bid_size, top_bid,  best_ask, best_ask_size, top_ask, avgPrice, row):
-
-    bid_price = best_bid + row['tick_size']
-    ask_price = best_ask - row['tick_size']
-
-    if best_bid_size < row['min_size'] * 1.5:
+    """
+    Calculate optimal bid and ask prices for market making.
+    
+    Strategy:
+    - Try to be at the top of the book (best bid + tick or best ask - tick)
+    - If there's small size at top, match it to compete
+    - Never cross the spread accidentally
+    """
+    tick = row['tick_size']
+    spread = best_ask - best_bid
+    
+    # === MORE AGGRESSIVE PRICING FOR MORE FILLS ===
+    # Default: try to be 1 tick better than current best
+    bid_price = best_bid + tick
+    ask_price = best_ask - tick
+    
+    # If spread is very tight (1-2 ticks), don't improve - just match
+    if spread <= tick * 2:
         bid_price = best_bid
-    
-    if best_ask_size < 250 * 1.5:
         ask_price = best_ask
+    # If spread is moderate (3-4 ticks), improve by 1 tick
+    elif spread <= tick * 4:
+        bid_price = best_bid + tick
+        ask_price = best_ask - tick
+    # If spread is wide, be more aggressive to capture it
+    else:
+        # Improve by 2 ticks on wide spreads to get filled faster
+        bid_price = best_bid + tick * 2
+        ask_price = best_ask - tick * 2
     
+    # If there's small size at the top, match it to compete
+    if best_bid_size < row['min_size'] * 1.5:
+        bid_price = max(bid_price, best_bid)  # At least match best
+    
+    if best_ask_size < row['min_size'] * 1.5:
+        ask_price = min(ask_price, best_ask)  # At least match best
 
+    # Safety: never cross the spread
     if bid_price >= top_ask:
         bid_price = top_bid
 
     if ask_price <= top_bid:
         ask_price = top_ask
 
-    if bid_price == ask_price:
+    if bid_price >= ask_price:
         bid_price = top_bid
         ask_price = top_ask
 
-    # if ask_price <= avgPrice:
-    #     if avgPrice - ask_price <= (row['max_spread']*1.7/100):
-    #         ask_price = avgPrice
-
-    #temp for sleep
+    # Ensure sell price is at least our average cost (if we have position)
     if ask_price <= avgPrice and avgPrice > 0:
         ask_price = avgPrice
 
@@ -156,35 +179,61 @@ def get_buy_sell_amount(position, bid_price, row, other_token_position=0):
     # Get max_size, defaulting to trade_size if not specified
     max_size = row.get('max_size', row['trade_size'])
     trade_size = row['trade_size']
+    min_size = row['min_size']
     
     # Calculate total exposure across both sides
     total_exposure = position + other_token_position
     
-    # If we haven't reached max_size on either side, continue building
+    # === AGGRESSIVE ENTRY STRATEGY ===
+    # Enter positions faster to capture more rewards
     if position < max_size:
-        # Continue quoting trade_size amounts until we reach max_size
+        # Calculate how much room we have
         remaining_to_max = max_size - position
-        buy_amount = min(trade_size, remaining_to_max)
         
-        # Only sell if we have substantial position (to allow for exit when needed)
-        if position >= trade_size:
+        # If we have less than 50% of max_size, be MORE aggressive
+        # This helps build positions faster in good markets
+        if position < max_size * 0.5:
+            # Try to build position with full trade_size
+            buy_amount = min(trade_size, remaining_to_max)
+        elif position < max_size * 0.8:
+            # Moderate position - standard sizing
+            buy_amount = min(trade_size, remaining_to_max)
+        else:
+            # Near max - be more conservative with buys
+            buy_amount = min(trade_size * 0.5, remaining_to_max)
+        
+        # === CONTINUOUS SELL QUOTING ===
+        # Always offer to sell when we have a position (for take profit)
+        # This ensures we're always providing liquidity on both sides
+        if position >= min_size:
+            # Quote sells even at smaller positions to capture spreads
             sell_amount = min(position, trade_size)
         else:
             sell_amount = 0
     else:
-        # We've reached max_size, implement progressive exit strategy
-        # Always offer to sell trade_size amount when at max_size
+        # We've reached max_size - focus on exits but maintain presence
         sell_amount = min(position, trade_size)
         
-        # Continue quoting to buy if total exposure warrants it
-        if total_exposure < max_size * 2:  # Allow some flexibility for market making
-            buy_amount = trade_size
+        # Keep a small buy quote to maintain market presence
+        # Only if we're not overexposed on both sides
+        if total_exposure < max_size * 1.8:
+            buy_amount = min(trade_size * 0.5, min_size)
         else:
             buy_amount = 0
 
-    # Ensure minimum order size compliance
-    if buy_amount > 0.7 * row['min_size'] and buy_amount < row['min_size']:
-        buy_amount = row['min_size']
+    # === ENSURE MINIMUM SIZE COMPLIANCE ===
+    # Adjust to meet minimum if we're close
+    if buy_amount > 0 and buy_amount < min_size:
+        if buy_amount >= min_size * 0.7:
+            buy_amount = min_size  # Round up to min
+        else:
+            buy_amount = 0  # Too small, skip
+    
+    if sell_amount > 0 and sell_amount < min_size:
+        if sell_amount >= min_size * 0.7:
+            sell_amount = min_size  # Round up to min
+        else:
+            sell_amount = 0  # Too small, skip
 
     # Apply multiplier for low-priced assets
     if bid_price < 0.1 and buy_amount > 0:

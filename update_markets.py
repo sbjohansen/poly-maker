@@ -271,6 +271,50 @@ def _compute_volatility_score(row):
         return -0.3  # Penalty for very high volatility
 
 
+def _compute_order_book_depth_score(row):
+    """
+    Score based on order book depth indicators.
+    
+    Deeper order books mean:
+    - More reliable order execution
+    - Easier to enter/exit positions
+    - Less slippage on larger orders
+    - More active market = more trade opportunities
+    """
+    try:
+        best_bid = float(row.get("best_bid", 0) or 0)
+        best_ask = float(row.get("best_ask", 1) or 1)
+        spread = float(row.get("spread", 1) or 1)
+        daily_rate = float(row.get("rewards_daily_rate", 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+    
+    # Higher daily rate indicates more volume/activity
+    # Scale: typically ranges from 0 to 5000+ for active markets
+    if daily_rate > 1000:
+        volume_score = 1.0
+    elif daily_rate > 500:
+        volume_score = 0.8
+    elif daily_rate > 200:
+        volume_score = 0.6
+    elif daily_rate > 100:
+        volume_score = 0.4
+    elif daily_rate > 50:
+        volume_score = 0.2
+    else:
+        volume_score = 0.1  # Low volume markets - fewer trades possible
+    
+    # Tight spreads with good volume = excellent for market making
+    if spread < 0.02 and daily_rate > 200:
+        # Very active, tight market
+        return volume_score * 1.5
+    elif spread < 0.05 and daily_rate > 100:
+        # Active market with reasonable spread
+        return volume_score * 1.2
+    else:
+        return volume_score
+
+
 def _compute_reward_efficiency_score(row):
     """
     Score based on reward relative to volatility (risk-adjusted return).
@@ -308,6 +352,7 @@ def compute_market_score(row, hyperparams=None):
     - Liquidity (spread)
     - Price proximity to favorable ranges
     - Reward efficiency (reward per unit risk)
+    - Order book depth / market activity
 
     Returns a composite score where higher is better.
     """
@@ -329,6 +374,7 @@ def compute_market_score(row, hyperparams=None):
     liquidity_score = _compute_liquidity_score(spread, best_bid, best_ask)
     volatility_score = _compute_volatility_score(row)
     efficiency_score = _compute_reward_efficiency_score(row)
+    depth_score = _compute_order_book_depth_score(row)  # NEW: order book depth
 
     # Weighted composite score
     # Primary factor: reward (normalized to ~0-5 range by dividing by typical max)
@@ -338,6 +384,7 @@ def compute_market_score(row, hyperparams=None):
         AUTO_REWARD_WEIGHT * reward_normalized
         + AUTO_PRICE_PROXIMITY_WEIGHT * price_score
         + AUTO_LIQUIDITY_WEIGHT * liquidity_score
+        + AUTO_LIQUIDITY_WEIGHT * depth_score  # NEW: factor in order book depth
         + volatility_score  # Already includes penalty
         - AUTO_VOL_WEIGHT * (vol_sum / 50.0)  # Normalized volatility penalty
         - AUTO_SPREAD_WEIGHT * (spread / 0.1)  # Normalized spread penalty

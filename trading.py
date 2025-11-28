@@ -152,20 +152,24 @@ def send_buy_order(order):
     existing_buy_size = order["orders"]["buy"]["size"]
     existing_buy_price = order["orders"]["buy"]["price"]
 
+    # === REDUCED FRICTION: More tolerant thresholds ===
     # Cancel orders if price changed significantly or size needs major adjustment
     price_diff = (
         abs(existing_buy_price - order["price"]) if existing_buy_price > 0 else float("inf")
     )
     size_diff = abs(existing_buy_size - order["size"]) if existing_buy_size > 0 else float("inf")
+    size_pct_diff = size_diff / order["size"] if order["size"] > 0 else float("inf")
 
+    # Very tolerant thresholds to minimize order churn
+    # Only cancel if price moved significantly (2+ cents) or size changed drastically (25%+)
     should_cancel = (
-        price_diff > 0.005  # Cancel if price diff > 0.5 cents
-        or size_diff > order["size"] * 0.1  # Cancel if size diff > 10%
+        price_diff > 0.02  # Cancel if price diff > 2 cents
+        or size_pct_diff > 0.25  # Cancel if size diff > 25%
         or existing_buy_size == 0  # Cancel if no existing buy order
     )
 
     if should_cancel and (existing_buy_size > 0 or order["orders"]["sell"]["size"] > 0):
-        print(f"Cancelling buy orders - price diff: {price_diff:.4f}, size diff: {size_diff:.1f}")
+        print(f"Cancelling buy orders - price diff: {price_diff:.4f}, size diff: {size_diff:.1f} ({size_pct_diff*100:.0f}%)")
         client.cancel_all_asset(order["token"])
     elif not should_cancel:
         print(
@@ -223,20 +227,24 @@ def send_sell_order(order):
     existing_sell_size = order["orders"]["sell"]["size"]
     existing_sell_price = order["orders"]["sell"]["price"]
 
+    # === REDUCED FRICTION: More tolerant thresholds ===
     # Cancel orders if price changed significantly or size needs major adjustment
     price_diff = (
         abs(existing_sell_price - order["price"]) if existing_sell_price > 0 else float("inf")
     )
     size_diff = abs(existing_sell_size - order["size"]) if existing_sell_size > 0 else float("inf")
+    size_pct_diff = size_diff / order["size"] if order["size"] > 0 else float("inf")
 
+    # Very tolerant thresholds to minimize order churn
+    # Only cancel if price moved significantly (2+ cents) or size changed drastically (25%+)
     should_cancel = (
-        price_diff > 0.005  # Cancel if price diff > 0.5 cents
-        or size_diff > order["size"] * 0.1  # Cancel if size diff > 10%
+        price_diff > 0.02  # Cancel if price diff > 2 cents
+        or size_pct_diff > 0.25  # Cancel if size diff > 25%
         or existing_sell_size == 0  # Cancel if no existing sell order
     )
 
     if should_cancel and (existing_sell_size > 0 or order["orders"]["buy"]["size"] > 0):
-        print(f"Cancelling sell orders - price diff: {price_diff:.4f}, size diff: {size_diff:.1f}")
+        print(f"Cancelling sell orders - price diff: {price_diff:.4f}, size diff: {size_diff:.1f} ({size_pct_diff*100:.0f}%)")
         client.cancel_all_asset(order["token"])
     elif not should_cancel:
         print(
@@ -555,18 +563,22 @@ async def perform_trade(market):
                     and buy_amount > 0
                     and buy_amount >= row["min_size"]
                 ):
-                    # Get reference price from market data
-                    sheet_value = row["best_bid"]
-
-                    if detail["name"] == "token2":
-                        sheet_value = 1 - row["best_ask"]
+                    # Get reference price from LIVE market data (not stale sheet data)
+                    # Use the actual best_bid we just fetched from order book
+                    sheet_value = best_bid  # Use live data instead of row["best_bid"]
 
                     sheet_value = round(sheet_value, round_length)
                     order["size"] = buy_amount
                     order["price"] = bid_price
 
-                    # Check if price is far from reference
+                    # Check if our bid price is reasonable compared to current best bid
+                    # Use percentage-based threshold for wide spreads
                     price_change = abs(order["price"] - sheet_value)
+                    spread = best_ask - best_bid
+                    
+                    # For wide spreads, allow more price deviation
+                    # Threshold: max of 10 cents OR 50% of spread
+                    price_threshold = max(0.10, spread * 0.5)
 
                     send_buy = True
 
@@ -588,14 +600,19 @@ async def perform_trade(market):
 
                     # Only proceed if we're not in risk-off period
                     if send_buy:
-                        # Don't buy if volatility is high or price is far from reference
-                        if row["3_hour"] > params["volatility_threshold"] or price_change >= 0.05:
+                        # Don't buy if volatility is too high OR price is unreasonably far from best bid
+                        if row["3_hour"] > params["volatility_threshold"]:
                             print(
                                 f'3 Hour Volatility of {row["3_hour"]} is greater than max volatility of '
-                                f'{params["volatility_threshold"]} or price of {order["price"]} is outside '
-                                f"0.05 of {sheet_value}. Cancelling all orders"
+                                f'{params["volatility_threshold"]}. Skipping buy but keeping existing orders.'
                             )
-                            client.cancel_all_asset(order["token"])
+                            # Don't cancel orders on high volatility - just don't place new ones
+                        elif price_change > price_threshold:
+                            print(
+                                f'Price of {order["price"]} is more than {price_threshold:.2f} away from '
+                                f'best bid {sheet_value}. Skipping this cycle.'
+                            )
+                            # Don't cancel - the order book data might be stale
                         else:
                             # Check for reverse position (holding opposite outcome)
                             rev_token = global_state.REVERSE_TOKENS[str(token)]
