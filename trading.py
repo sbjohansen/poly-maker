@@ -456,10 +456,14 @@ async def perform_trade(market):
                     "row": row,
                 }
 
+                # Show pending orders to understand total exposure
+                pending_buy = orders["buy"]["size"]
+                pending_sell = orders["sell"]["size"]
                 print(
                     f"Position: {position}, Other Position: {other_position}, "
                     f"Trade Size: {row['trade_size']}, Max Size: {max_size}, "
-                    f"buy_amount: {buy_amount}, sell_amount: {sell_amount}"
+                    f"buy_amount: {buy_amount}, sell_amount: {sell_amount}, "
+                    f"Pending: Buy={pending_buy:.0f}, Sell={pending_sell:.0f}"
                 )
 
                 # File to store risk management information for this market
@@ -477,19 +481,20 @@ async def perform_trade(market):
                     # Get fresh market data
                     n_deets = get_best_bid_ask_deets(market, detail["name"], 100, 0.1)
                     current_best_bid = n_deets["best_bid"]
-                    current_spread = round(n_deets["best_ask"] - n_deets["best_bid"], 2)
+                    current_best_ask = n_deets["best_ask"]
+                    current_spread = round(current_best_ask - current_best_bid, 2)
                     
                     # Check if we already have a sell order working
                     existing_sell_size = orders["sell"]["size"]
                     existing_sell_price = orders["sell"]["price"]
                     
                     if existing_sell_size > 0:
-                        # Check if existing order is stale (market moved significantly in our favor)
-                        # If best_bid is now much higher than our sell price, update to capture gains
+                        # Check if existing order needs to be updated
                         price_improvement = current_best_bid - existing_sell_price
+                        price_too_high = existing_sell_price - current_best_ask  # How far above market
                         
-                        if price_improvement > 0.10:  # Market moved 10+ cents in our favor
-                            # Update to better price - sell at current best bid
+                        if price_improvement > 0.10:
+                            # Market moved UP - update to capture gains
                             order["size"] = existing_sell_size
                             order["price"] = current_best_bid
                             
@@ -499,11 +504,23 @@ async def perform_trade(market):
                             )
                             send_sell_order(order)
                             continue
+                        elif price_too_high > 0.15:
+                            # Sell order is WAY above market - will never fill
+                            # Update to realistic price (best_ask or slightly below)
+                            order["size"] = existing_sell_size
+                            order["price"] = current_best_ask  # Place at ask to have chance of filling
+                            
+                            print(
+                                f"📉 SELL ORDER UNREALISTIC: Order at {existing_sell_price:.2f} is {price_too_high:.2f} "
+                                f"above best ask {current_best_ask:.2f}. Updating to realistic price."
+                            )
+                            send_sell_order(order)
+                            continue
                         else:
                             # Order is at reasonable price - let it work
                             print(
                                 f"✓ Existing sell order active: {existing_sell_size:.0f} @ {existing_sell_price:.2f}. "
-                                f"Best bid: {current_best_bid:.2f}. Letting it work."
+                                f"Best bid: {current_best_bid:.2f}, Best ask: {current_best_ask:.2f}. Letting it work."
                             )
                             continue  # Skip - let existing order work
                     
@@ -603,16 +620,29 @@ async def perform_trade(market):
                 # Get max_size, defaulting to trade_size if not specified
                 max_size = row.get("max_size", row["trade_size"])
 
+                # Calculate TOTAL potential position including pending buy orders
+                # This prevents over-buying when orders fill faster than position updates
+                existing_buy_size = orders["buy"]["size"]
+                potential_position = position + existing_buy_size
+                
                 # Only buy if:
-                # 1. Position is less than max_size (new logic)
+                # 1. Position + pending orders is less than max_size
                 # 2. Position is less than absolute cap (250)
                 # 3. Buy amount is above minimum size
                 if (
-                    position < max_size
+                    potential_position < max_size
                     and position < 250
                     and buy_amount > 0
                     and buy_amount >= row["min_size"]
                 ):
+                    # Adjust buy_amount to not exceed max_size when combined with pending
+                    remaining_capacity = max_size - potential_position
+                    if buy_amount > remaining_capacity:
+                        buy_amount = remaining_capacity
+                        if buy_amount < row["min_size"]:
+                            print(f"Skipping buy - remaining capacity {remaining_capacity:.0f} below min_size {row['min_size']}")
+                            continue
+                    
                     # Get reference price from LIVE market data (not stale sheet data)
                     # Use the actual best_bid we just fetched from order book
                     sheet_value = best_bid  # Use live data instead of row["best_bid"]
